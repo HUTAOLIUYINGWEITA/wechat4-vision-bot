@@ -1,5 +1,13 @@
 # wechat4-vision-bot
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D4?logo=windows)
+![WeChat](https://img.shields.io/badge/WeChat-4.x-07C160?logo=wechat)
+![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python)
+![No UI Automation](https://img.shields.io/badge/automation-pixel%20%2B%20OCR-8957e5)
+
+**微信 4.x 的纯视觉自动回复机器人 —— 像素 + OCR 驱动，不依赖 UIAutomation 控件树。**
+
 > **English abstract** — A WeChat **4.x (Windows)** auto-reply agent built purely on **vision**:
 > `PrintWindow`/`ImageGrab` screenshots, **Tesseract OCR** (`chi_sim`), controlled clicks and clipboard
 > paste, plus an OpenAI-compatible LLM endpoint for reply generation. Unlike `wxauto` / `pywinauto`
@@ -424,3 +432,16 @@ sha256_hex = sha256(bytes.fromhex(salt) + password.encode("utf-8")).hexdigest()
 ## License
 
 [MIT](LICENSE) © 2026 wechat4-vision-bot contributors
+
+## Credits
+
+- **主要设计与实现**：**DeepSeek Agent**（AI 编程助手）
+  本项目从架构设计、全部代码编写、真机调试、到 `docs/踩坑记录.md` 的整理，均由 DeepSeek Agent 完成。
+  包括但不限于：微信 4.x 搜索下拉的定位策略、OCR 放大合并、受控点击与标题校验、
+  剪贴板发送与三重校验、注入前前台校验、Esc 规矩与窗口存活守护、熔断与三处急停。
+- **需求、技术决策与实机环境**：**HUTAOLIUYINGWEITA**
+  提出需求并逐条拍板技术路线（自动化边界、护栏强度、两级密码、远程指令取舍），
+  提供测试机器，并在每一轮真机验证中给出关键反馈 —— 多个"看起来能用其实是坏的"问题
+  都是在他的实测反馈下才被定位。
+
+> 这是一次人机协作的实践：**AI 负责实现细节，人负责判断取舍**。
