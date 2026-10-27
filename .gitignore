@@ -1,0 +1,54 @@
+# ───────── 密钥 / 个人配置（绝不入库）─────────
+config.json
+persona.txt
+.credentials.json
+.credentials.yaml
+*.credentials.json
+.env
+
+# ───────── 运行期状态文件（全是本机私人数据）─────────
+state.json
+*_state.json
+reply_state.json
+guard_state.json
+breaker_state.json
+breaker_tripped.json
+signal.json
+remote_pending.json
+remote_notify_state.json
+watcher.lock
+STOP
+tmp-inject-unread.json
+
+# ───────── 日志 / 截图 / OCR 临时文件 ─────────
+logs/
+screenshots/
+tmp-ocr/
+*.log
+
+# ───────── 备份文件 ─────────
+*.bak
+*.bak-*
+
+# ───────── Python ─────────
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+
+# ───────── 编辑器 / 系统垃圾 ─────────
+.vscode/
+.idea/
+*.lnk
+desktop.ini
+Thumbs.db
+.DS_Store
+
+# ───────── 本地自测产物 ─────────
+selftest-wechat.png
+selftest-remote*.txt
+tmp-guard-selftest.json

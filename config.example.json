@@ -1,0 +1,193 @@
+{
+  "_comment": "wechat4-vision-bot 配置模板。复制成 config.json 再改；config.json 已被 .gitignore 忽略，绝不要提交。所有布尔开关默认关闭（安全优先）。",
+  "enabled": false,
+  "autoSend": false,
+  "intervalSeconds": 3,
+  "quietHours": [],
+  "whitelist": [
+    "文件传输助手"
+  ],
+  "blacklist": [
+    "微信团队",
+    "腾讯新闻",
+    "服务号",
+    "订阅号",
+    "微信支付",
+    "文件传输助手助手"
+  ],
+  "maxRepliesPerHour": 30,
+  "sound": true,
+  "notifyExistingOnStart": false,
+  "triggerCooldownSeconds": 10,
+  "retryAfterSeconds": 60,
+  "maxRetryAttempts": 3,
+  "replyConfirmTimeoutSeconds": 180,
+  "busyGuard": {
+    "enabled": true,
+    "gameProcesses": [
+      "WorldOfTanks.exe",
+      "WorldOfTanks",
+      "WoT.exe",
+      "wot.exe",
+      "Tanks.exe",
+      "Tank.exe",
+      "cs2.exe",
+      "csgo.exe"
+    ],
+    "fullscreenAllowProcesses": [
+      "explorer.exe",
+      "chrome.exe",
+      "msedge.exe",
+      "firefox.exe",
+      "brave.exe",
+      "opera.exe",
+      "vivaldi.exe",
+      "iexplore.exe",
+      "360se.exe",
+      "360chrome.exe",
+      "qqbrowser.exe"
+    ],
+    "userActiveSeconds": 5,
+    "fullscreenMinCoverRatio": 0.92
+  },
+  "dedupe": {
+    "settleScans": 2
+  },
+  "ocr": {
+    "enabled": true,
+    "tesseract": "",
+    "lang": "chi_sim",
+    "timeoutMs": 10000
+  },
+  "whitelistMatch": {
+    "coverageThreshold": 0.7,
+    "coverageThresholdLoose": 0.55,
+    "looseMinMatched": 6
+  },
+  "detect": {
+    "windowClass": "Qt51514QWindowIcon",
+    "capture": "auto",
+    "rowDiffThreshold": 0.03,
+    "minBadgeArea": 40,
+    "taskbarEnabled": true
+  },
+  "gen": {
+    "enabled": true,
+    "credentials": ".credentials.json",
+    "personaFile": "persona.txt",
+    "maxTokens": 120,
+    "temperature": 0.8,
+    "timeoutSeconds": 25,
+    "maxReplyChars": 80,
+    "ocrPreview": true,
+    "sendTimeoutSeconds": 120,
+    "forbid": [
+      "转账",
+      "汇款",
+      "付款",
+      "红包",
+      "密码",
+      "验证码",
+      "银行卡",
+      "http://",
+      "https://",
+      "www.",
+      "二维码",
+      "扫码",
+      "点击链接",
+      "点链接",
+      "sk-",
+      "密钥",
+      "api key",
+      "apikey",
+      "发文件",
+      "附件给你"
+    ],
+    "testHooks": false
+  },
+  "guard": {
+    "enabled": true,
+    "whitelistOnly": true,
+    "perChatMinIntervalSeconds": 30,
+    "perChatMaxBurst": 5,
+    "burstPauseSeconds": 1800,
+    "burstResetSeconds": 600,
+    "dedupeSameText": true,
+    "dedupeWindowSeconds": 600,
+    "sentLogEnabled": true
+  },
+  "breaker": {
+    "enabled": true,
+    "consecutiveFailures": 3,
+    "resetOnSuccess": true
+  },
+  "panic": {
+    "enabled": true,
+    "hotkey": "ctrl+alt+shift+s",
+    "wechatKeywords": [
+      "急停",
+      "停止"
+    ],
+    "toast": true
+  },
+  "wake": {
+    "_comment": "历史遗留：早期用「DSH session/prompt」唤醒本地 Agent，现已停用（保留字段仅兼容）。当前回复走进程内直连 API（genreply.py）。",
+    "enabled": false,
+    "channel": "off",
+    "baseUrl": "http://127.0.0.1:19387",
+    "dshHome": "",
+    "sessionId": "",
+    "sessionTitle": "微信看门狗",
+    "cwd": "",
+    "promptTemplate": ""
+  },
+  "remote": {
+    "_comment": "🔴 微信消息 -> 操作电脑（远程指令）。默认关闭；开启前先读 README 的安全警告，并用 tools/setup_password.py 生成两级密码。",
+    "enabled": false,
+    "triggerWord": "小耳朵",
+    "levels": {
+      "L1": {
+        "salt": "",
+        "sha256": "",
+        "_comment": "未设置；用 python tools/setup_password.py 生成",
+        "label": "只读/低风险",
+        "allow": [
+          "send_file",
+          "screenshot",
+          "report_status",
+          "read_text"
+        ]
+      },
+      "L2": {
+        "salt": "",
+        "sha256": "",
+        "_comment": "未设置；用 python tools/setup_password.py 生成",
+        "label": "高危",
+        "allow": [
+          "send_file",
+          "screenshot",
+          "report_status",
+          "read_text",
+          "run_command",
+          "modify_file",
+          "delete_file",
+          "install",
+          "start_stop_app"
+        ]
+      }
+    },
+    "pendingTtlSeconds": 180,
+    "maxWrongAttempts": 3,
+    "lockoutSeconds": 900,
+    "targetSessionId": "",
+    "targetSessionTitle": "",
+    "auditFile": "logs/remote-YYYYMMDD.jsonl",
+    "fallbackNotifyChat": "",
+    "notifyToast": false,
+    "notifyCooldownSeconds": 600
+  },
+  "reply": {
+    "restoreForeground": false,
+    "restoreClipboard": false
+  }
+}

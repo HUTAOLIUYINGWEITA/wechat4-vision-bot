@@ -1,0 +1,14 @@
+# wechat4-vision-bot 依赖（pip）
+#
+# 说明：本项目只在 Windows + 微信 4.x 上工作，依赖全部是纯 pip 包；
+#       唯一的**外部**依赖是 Tesseract OCR（不是 pip 包），装法见 README：
+#         - Windows 安装包：https://github.com/UB-Mannheim/tesseract/wiki
+#         - 必须额外勾选/下载中文简体语言包 chi_sim.traineddata
+#
+# Python >= 3.10（实测 3.13）。
+
+numpy>=1.24
+opencv-python>=4.8
+Pillow>=10.0
+pywin32>=306
+PyYAML>=6.0
