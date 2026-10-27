@@ -1,4 +1,4 @@
-﻿# 微信消息看门狗 - 总开关（真上岗 / 真停车）/ 急停 / 状态
+# 微信消息看门狗 - 总开关（真上岗 / 真停车）/ 急停 / 状态
 # 2026-10-26 改造：on = 起进程 + autoSend；off = 杀进程；stop = 只杀进程；panic = 立即杀
 # 用法（在项目目录）:
 #   .\toggle.ps1 on      真上岗：enabled=true + autoSend=true + 删 STOP + 确保 watcher 进程在跑
@@ -19,12 +19,8 @@ $StopFile = Join-Path $Base "STOP"
 $LockFile = Join-Path $Base "watcher.lock"
 $LogDir = Join-Path $Base "logs"
 $WatcherPy = Join-Path $Base "watcher.py"
-# Python 解释器：优先环境变量 WECHAT_BOT_PYTHON，其次 PATH 里的 python（不写死任何绝对路径）
-$Python = $env:WECHAT_BOT_PYTHON
-if (-not $Python -or -not (Test-Path $Python)) {
-    $pyCmd = Get-Command python -ErrorAction SilentlyContinue
-    if ($pyCmd -and $pyCmd.Source) { $Python = $pyCmd.Source } else { $Python = "python" }
-}
+$Python = "python"
+if (-not (Test-Path $Python)) { $Python = "python" }
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 function Read-Cfg {
@@ -164,11 +160,8 @@ function Start-Watcher {
         return $running
     }
     Clear-Lock
-    $pythonw = $Python
-    if (Test-Path $Python) {
-        $cand = Join-Path (Split-Path -Parent $Python) "pythonw.exe"
-        if (Test-Path $cand) { $pythonw = $cand }
-    }
+    $pythonw = Join-Path (Split-Path -Parent $Python) "pythonw.exe"
+    if (-not (Test-Path $pythonw)) { $pythonw = $Python }
     Start-Process -FilePath $pythonw -ArgumentList "`"$WatcherPy`"" -WorkingDirectory $Base -WindowStyle Hidden
     # 等 2~3 秒回读 watcher.lock 确认进程真的起来了
     for ($i = 0; $i -lt 30; $i++) {

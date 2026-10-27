@@ -3,9 +3,16 @@
 
 5 条护栏（全部在 config.json 的 guard 段可调）：
   1. 白名单外绝不发              guard.whitelistOnly
-  2. 同一会话 N 秒内只发 1 条     guard.perChatMinIntervalSeconds（默认 30）
-  3. 同一会话连续 <= N 条         guard.perChatMaxBurst（默认 5）-> 暂停，停了等用户发话
+  2. 同一会话 N 秒内只发 1 条     guard.perChatMinIntervalSeconds（默认 4）
+     ⚠ 被这条拦下的消息**不丢弃**：watcher 会把它入队（pending_replies.json），
+       冷却结束后合并成一条回复补发（见 watcher._queue_rate_limited_reply / flush_pending_replies）。
+  3. 同一会话连续 <= N 条         guard.perChatMaxBurst（默认 12）-> 暂停
+     ⚠ 这是本项目自己加的「防刷屏保险」（防止代码进循环给好友刷屏），与腾讯风控无关；
+       达到上限被跳过时不丢弃：watcher 会入队，暂停结束合并补发 / 过期丢弃并记日志。
   4. 同一句话不重复发             guard.dedupeSameText（默认 true）
+     ⚠ 2026-10-27 修复（用户实测「正确答案撞旧句子被丢、等了 3 分钟没回复」）：
+       窗口从 600s 缩到 **60s**（guard.dedupeSameTextWindowSeconds），只拦「同一会话 + 完全相同文本」；
+       被拦住时 watcher 会**换一种说法重生成**（不丢弃消息）；重生成仍撞车才不发 + 记 reply-failures。
   5. 每条成功发送写 logs/sent-YYYYMMDD.jsonl（时间/会话名/回复原文/未读指纹）
 
 只做判断与记录，不碰微信、不发消息（发送仍由 watcher 调 reply.py）。
@@ -22,12 +29,14 @@ GUARD_TAG = "[GUARD]"
 DEFAULT_GUARD = {
     "enabled": True,
     "whitelistOnly": True,
-    "perChatMinIntervalSeconds": 30,
-    "perChatMaxBurst": 5,
+    "perChatMinIntervalSeconds": 4,
+    "perChatMaxBurst": 12,
     "burstPauseSeconds": 1800,
     "burstResetSeconds": 600,
     "dedupeSameText": True,
-    "dedupeWindowSeconds": 600,
+    # 2026-10-27：去重窗口（拦「同一会话+完全相同文本」）600 -> 60s；600 只用于保留 recentTexts 历史
+    "dedupeSameTextWindowSeconds": 60,
+    "dedupeWindowSeconds": 600,          # recentTexts 历史保留窗口（供「换说法」禁止清单用）
     "sentLogEnabled": True,
 }
 
@@ -166,8 +175,8 @@ def check(cfg, st, chat, text, whitelisted, now=None):
 
     # 3) 连续条数用满 -> 停了等用户发话
     if paused_until and now < paused_until:
-        res.update({"ok": False, "skip": "paused-burst-limit", "stop": True,
-                    "detail": "连续 %d 条已达上限，暂停到 %s（等用户发话）"
+        res.update({"ok": False, "skip": "per-chat-burst", "stop": True,
+                    "detail": "本会话已连发 %d 条，暂停至 %s（暂停期结束后自动恢复）"
                               % (consecutive, _ts(paused_until)),
                     "nextAllowedAt": paused_until})
         return res
@@ -176,9 +185,9 @@ def check(cfg, st, chat, text, whitelisted, now=None):
         rec["pausedUntil"] = until
         rec["pausedReason"] = "consecutive>=%d" % max_burst
         rec["consecutive"] = max_burst
-        res.update({"ok": False, "skip": "per-chat-burst-limit", "stop": True,
-                    "detail": "同一会话已连续发 %d 条（上限 %d）-> 停了等用户发话，暂停 %.0f 秒"
-                              % (consecutive, max_burst, max(pause, 60.0)),
+        res.update({"ok": False, "skip": "per-chat-burst", "stop": True,
+                    "detail": "本会话已连发 %d 条，暂停至 %s（暂停期结束后自动恢复）"
+                              % (max_burst, _ts(until)),
                     "nextAllowedAt": until})
         return res
 
@@ -190,22 +199,48 @@ def check(cfg, st, chat, text, whitelisted, now=None):
                     "nextAllowedAt": last + min_int})
         return res
 
-    # 4) 同一句话不重复发
+    # 4) 同一句话不重复发（同一会话 + 完全相同文本 + 60s 短窗）
     if g.get("dedupeSameText", True):
-        win = float(g.get("dedupeWindowSeconds") or 600)
-        _prune_recent(rec, win, now)
+        win = float(g.get("dedupeSameTextWindowSeconds")
+                    or g.get("dedupeWindowSeconds") or 60)
+        _prune_recent(rec, float(g.get("dedupeWindowSeconds") or 600), now)
         want = norm(text)
         for item in rec.get("recentTexts") or []:
-            if norm(item.get("text")) == want:
+            if norm(item.get("text")) == want and (now - float(item.get("ts") or 0)) <= win:
                 res.update({"ok": False, "skip": "duplicate-text",
                             "detail": "同一句话 %s 已发过（%s）"
                                       % (time.strftime("%Y-%m-%d %H:%M:%S",
                                                        time.localtime(float(item.get("ts") or 0))),
-                                         "去重窗口 %.0fs" % win)})
+                                         "去重窗口 %.0fs" % win),
+                            "recentTexts": recent_texts(st, chat, limit=3, now=now)})
                 return res
 
     res["detail"] = "护栏通过"
     return res
+
+
+def recent_texts(st, chat, limit=3, window=None, now=None):
+    """取该会话最近已发送的文本（最新在前，去重）——供 watcher「换说法」时做禁止重复清单。"""
+    now = float(now if now is not None else time.time())
+    win = float(window) if window is not None else 600.0
+    try:
+        rec = _chat_rec(st, chat)
+    except Exception:
+        return []
+    _prune_recent(rec, win, now)
+    out, seen = [], set()
+    for item in reversed(rec.get("recentTexts") or []):
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        key = norm(text)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+        if len(out) >= max(1, int(limit or 3)):
+            break
+    return out
 
 
 def record(cfg, st, chat, text, fingerprint="", extra=None, now=None):

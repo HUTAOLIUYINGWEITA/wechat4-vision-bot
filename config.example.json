@@ -62,7 +62,17 @@
   "whitelistMatch": {
     "coverageThreshold": 0.7,
     "coverageThresholdLoose": 0.55,
-    "looseMinMatched": 6
+    "looseMinMatched": 6,
+    "_comment": "白名单判定：只在几个已知会话名里挑最像的。OCR 读歪一个字不该导致漏回。",
+    "ratioWeight": 0.55,
+    "jaccardWeight": 0.3,
+    "lengthWeight": 0.15,
+    "minComposite": 0.55,
+    "minMargin": 0.12,
+    "missCooldownSeconds": 45,
+    "greyZoneLow": 0.55,
+    "greyZoneHigh": 0.65,
+    "_greyzone_comment": "灰区（低~高）时先打开会话核对标题再决定发不发，避免误发到非白名单会话。"
   },
   "detect": {
     "windowClass": "Qt51514QWindowIcon",
@@ -103,7 +113,14 @@
       "发文件",
       "附件给你"
     ],
-    "testHooks": false
+    "testHooks": false,
+    "_vision_comment": "视觉模式：把聊天区截图直接发给模型（多模态），OCR 仅作辅助/兜底。",
+    "visionEnabled": true,
+    "visionModel": "",
+    "visionMaxEdge": 1600,
+    "readChatArea": true,
+    "chatReadMaxBubbles": 3,
+    "chatReadTimeoutSeconds": 60
   },
   "guard": {
     "enabled": true,
@@ -114,7 +131,11 @@
     "burstResetSeconds": 600,
     "dedupeSameText": true,
     "dedupeWindowSeconds": 600,
-    "sentLogEnabled": true
+    "sentLogEnabled": true,
+    "dedupeSameTextWindowSeconds": 60,
+    "_dedupe_comment": "同句去重窗口：只防\"代码循环导致复读\"，不是长时间禁言。命中后会要求模型换一种说法重新生成。",
+    "duplicateRegenAttempts": 2,
+    "_interval_comment": "同一会话最小发送间隔会。30 秒偏保守；想要聊天自然可降到 4~10 秒（发送一条本身就要 8~13 秒）。"
   },
   "breaker": {
     "enabled": true,
@@ -188,6 +209,29 @@
   },
   "reply": {
     "restoreForeground": false,
-    "restoreClipboard": false
+    "restoreClipboard": false,
+    "inputPixelDiffMin": 0.002
+  },
+  "pendingQueue": {
+    "_comment": "被限流/连发上限拦下的消息不丢弃：入队，冷却结束后合并生成一条回复。",
+    "enabled": true,
+    "ttlSeconds": 600,
+    "maxTexts": 5,
+    "retryAfterSeconds": 20,
+    "maxAttempts": 3,
+    "logWaitEverySeconds": 15
+  },
+  "chatTypes": {
+    "_comment": "会话类型：group=群聊 / private=私聊 / memo=自己的备忘录（如「文件传输助手」，不是真人在跟你聊）。未配置时按标题 (数字) 自动推断。",
+    "文件传输助手": "memo",
+    "示例长名测试群甲乙丙丁戊己": "group"
+  },
+  "memoLog": {
+    "_comment": "把她做过的\"动作\"（远程执行完成/发文件成功/熔断急停）记一行到备忘录，方便回看。普通闲聊不记录。",
+    "enabled": true,
+    "chat": "文件传输助手",
+    "maxPerMinute": 1,
+    "maxPerDay": 200,
+    "auditFile": "logs/memo-YYYYMMDD.jsonl"
   }
 }

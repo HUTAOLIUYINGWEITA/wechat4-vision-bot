@@ -24,11 +24,11 @@
   * config.wake.enabled=false（默认）：唤醒 Agent 这条链不在流程里（代码保留但不调用）
 
 依赖：系统 Python 已有 numpy / Pillow / opencv / pywin32 / PyYAML（不安装任何包，HTTP 用 urllib）
-用法: python watcher.py [--once] [--selftest] [--status]
-      python watcher.py [--test-gen "会话" "对方消息"]   # 只测生成，不发
-      python watcher.py [--inject-unread --chat "文件传输助手" --incoming "..."]
+用法: E:\\anaconda\\python.exe watcher.py [--once] [--selftest] [--status]
+      E:\\anaconda\\python.exe watcher.py [--test-gen "会话" "对方消息"]   # 只测生成，不发
+      E:\\anaconda\\python.exe watcher.py [--inject-unread --chat "文件传输助手" --incoming "..."]
                                                                           # 造一条白名单未读（测试钩子）
-      python watcher.py [--guard-selftest]               # 发送护栏自检
+      E:\\anaconda\\python.exe watcher.py [--guard-selftest]               # 发送护栏自检
 """
 
 import ctypes
@@ -112,7 +112,10 @@ GUARD_STATE_PATH = os.path.join(BASE_DIR, "guard_state.json")
 PERSONA_PATH = os.path.join(BASE_DIR, "persona.txt")
 CREDENTIALS_PATH = os.path.join(BASE_DIR, ".credentials.json")
 REPLY_PY_PATH = os.path.join(BASE_DIR, "reply.py")
-SEND_PY_PATH = os.path.join(BASE_DIR, "sendfile.py")
+# 限流排队补发（2026-10-27 用户实测修复）：per-chat-interval 不再丢弃消息，
+# 被限流的消息入队到 pending_replies.json，冷却结束后合并成一条回复；
+# 队列消息绝不写 processed_fingerprint（旧 bug：限流跳过也写指纹 -> 永久漏回）。
+PENDING_REPLY_PATH = os.path.join(BASE_DIR, "pending_replies.json")
 INJECT_PATH = os.path.join(BASE_DIR, "tmp-inject-unread.json")
 # ── 熔断 / 急停（2026-10-27 第一阶段）──
 #   熔断状态：{consecutiveFailures,lastFailureAt,lastReason}（发送成功一次即清零）
@@ -130,10 +133,150 @@ WECHAT_CLASS = "Qt51514QWindowIcon"
 WECHAT_TITLE = "微信"
 VERSION = "2.0.0"
 
+MEMO_STATE = {"day": "", "sends": 0, "times": []}
+
+
+def _memo_wechat_available():
+    """memo 发送前可用性检查：固定返回 (ok, why)。微信窗口存在/非最小化 + 忙闲守护通过才可用。"""
+    try:
+        if os.path.exists(STOP_PATH):
+            return False, "stop"
+        try:
+            bg = busyguard.evaluate(load_config())
+            if bg.get("busy"):
+                return False, "busy: %s" % (bg.get("reason") or "busy")
+        except Exception:
+            pass
+        hwnd = find_wechat_window_simple()
+        if not hwnd:
+            return False, "wechat-window-not-found"
+        return True, ""
+    except Exception as exc:
+        return False, "check-error: %s" % exc
+
+def _memo_cfg(cfg):
+    mc = (cfg or {}).get("memoLog") or {}
+    return mc if isinstance(mc, dict) else {}
+
+
+def memo_audit(cfg, rec):
+    mc = _memo_cfg(cfg)
+    pat = str(mc.get("auditFile") or "logs/memo-YYYYMMDD.jsonl").replace("YYYYMMDD", time.strftime("%Y%m%d"))
+    path = pat if os.path.isabs(pat) else os.path.join(BASE_DIR, pat)
+    try:
+        os.makedirs(os.path.dirname(path) or BASE_DIR, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        log_warn("[MEMO] audit write failed: %s" % exc)
+
+
+def memo_log(cfg, reason, text, available=None):
+    """Record an action into the memo chat. Never affects main flow."""
+    mc = _memo_cfg(cfg)
+    if not mc.get("enabled", True):
+        return False
+    chat = str(mc.get("chat") or "文件传输助手")
+    body = str(text or "")
+    try:
+        body = redact_known_password(body)
+    except Exception:
+        pass
+    body = re.sub(r"[A-Za-z]:[\\/][^\s，,。;；、)）]*", lambda m: os.path.basename(m.group(0).replace("\\", "/")) or "[file]", body).strip()[:200]
+    if not body:
+        return False
+    now = time.time(); day = time.strftime("%Y%m%d")
+    global MEMO_STATE
+    if MEMO_STATE.get("day") != day:
+        MEMO_STATE = {"day": day, "sends": 0, "times": []}
+    MEMO_STATE["times"] = [x for x in MEMO_STATE.get("times") or [] if now - float(x) < 60]
+    try:
+        max_min = max(1, int(mc.get("maxPerMinute") or 1)); max_day = max(1, int(mc.get("maxPerDay") or 200))
+    except Exception:
+        max_min, max_day = 1, 200
+    rec = {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "ts": round(now, 3), "reason": str(reason or ""), "text": body, "ok": False, "err": ""}
+    if len(MEMO_STATE["times"]) >= max_min:
+        rec["err"] = "rate-limited"; memo_audit(cfg, rec)
+        log_warn("[MEMO] rate limit (maxPerMinute=%d) -> audit only: %r" % (max_min, body)); return False
+    if int(MEMO_STATE.get("sends") or 0) >= max_day:
+        rec["err"] = "daily-limit"; memo_audit(cfg, rec); return False
+    # 统一约定（2026-10-27 修复）：可用性检查固定返回 (ok: bool, why: str)；why 空串=可用。
+    checker = available if available is not None else _memo_wechat_available
+    try:
+        _r = checker()
+        if isinstance(_r, tuple):
+            ok_avail, why = bool(_r[0]), str(_r[1] if len(_r) > 1 else "")
+        else:
+            ok_avail, why = bool(_r), ""
+    except Exception as exc:
+        ok_avail, why = False, "check-error: %s" % exc
+    if not ok_avail:
+        rec["err"] = "wechat-unavailable: %s" % why; memo_audit(cfg, rec)
+        log_warn("[MEMO] wechat unavailable (%s) -> audit only: %r" % (why, body)); return False
+    try:
+        python = sys.executable or "E:\\anaconda\\python.exe"
+        proc = subprocess.run([python, REPLY_PY_PATH, "--chat", chat, "--text", body], cwd=BASE_DIR, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180, creationflags=0x08000000)
+        doc = None
+        for line in reversed((proc.stdout or "").strip().splitlines()):
+            line = line.strip()
+            if line.startswith("{") and line.endswith("}"):
+                try: doc = json.loads(line); break
+                except Exception: pass
+        rec["ok"] = bool(proc.returncode == 0 and isinstance(doc, dict) and doc.get("ok") is True)
+        if not rec["ok"]: rec["err"] = "reply-failed: rc=%s" % proc.returncode
+    except Exception as exc:
+        rec["err"] = "exception: %s" % str(exc)[:200]
+    MEMO_STATE["times"].append(now)
+    if rec["ok"]: MEMO_STATE["sends"] = int(MEMO_STATE.get("sends") or 0) + 1
+    memo_audit(cfg, rec)
+    if rec["ok"]: log_info("[MEMO] recorded (%s): %r" % (reason, body))
+    else: log_warn("[MEMO] record failed (%s): %s" % (reason, rec["err"]))
+    return bool(rec["ok"])
+
+
+def genreply_resolve_chat_type(chat, chat_types=None, display=""):
+    """会话类型解析（memo/group/private）。config.chatTypes 优先；无配置时标题 (N) -> group。"""
+    name = str(chat or "").strip()
+    disp = str(display or "").strip()
+    tnorm = {str(k).strip(): str(v).strip().lower()
+             for k, v in (chat_types or {}).items() if str(k).strip()}
+    label = tnorm.get(name) or tnorm.get(disp) or ""
+    members = 0
+    for cand in (disp, name):
+        m = re.search(r"[（(]\s*(\d+)\s*[)）]\s*$", cand)
+        if m:
+            try:
+                members = int(m.group(1))
+            except Exception:
+                members = 0
+            break
+    if not label:
+        label = "group" if members > 0 else "private"
+    if label == "memo":
+        line = ("【会话类型】备忘录（%s）—— 这是你自己的备忘录/工作台，不是另一个人在跟你聊天。"
+                "你可以在里面记录东西、也可以简短回应；但不要把它当成真人对话对象去寒暄、"
+                "问「在吗/咋啦」。" % (name or disp or "文件传输助手"))
+        hint = ("这是你自己（小耳朵）的备忘录/工作台：回复简短一两句即可（不强制字数）；"
+                "如果内容是测试/记事，回一句简短确认就行；不要寒暄。")
+    elif label == "group":
+        extra = ("，共 %d 人" % members) if members > 0 else ""
+        line = ("【会话类型】群聊（%s%s）。群里可能有多个人在说话，只回最后一条/最近几条，"
+                "不要当私聊处理。" % (name or disp, extra))
+        hint = "这是群聊：只针对最近一条/最近几条消息回复，不要脑补群里其他人的对话。"
+    else:
+        label = "private"
+        line = "【会话类型】私聊（%s）。" % (name or disp)
+        hint = "这是私聊：正常自然回复即可，不要脑补出群里其他成员。"
+    return {"type": label, "name": name or disp, "members": members,
+            "line": line, "hint": hint,
+            "label": {"memo": "备忘录", "group": "群聊", "private": "私聊"}.get(label, label)}
+
 DEFAULT_CONFIG = {
-    # 公开版安全默认：没有 config.json 时不自动上岗（要真上岗必须显式 enabled=true）
-    "enabled": False,
+    "enabled": True,
     "autoSend": False,
+    "chatTypes": {},
+    "memoLog": {"enabled": True, "chat": "文件传输助手", "maxPerMinute": 1,
+                "maxPerDay": 200, "auditFile": "logs/memo-YYYYMMDD.jsonl"},
     "intervalSeconds": 3,
     "quietHours": [23, 8],
     "whitelist": [],
@@ -179,9 +322,24 @@ DEFAULT_CONFIG = {
         "timeoutMs": 10000,
     },
     "whitelistMatch": {
+        # 旧 prefix 匹配参数（保留：黑名单/单条 hint 匹配仍用 name_match）
         "coverageThreshold": 0.70,
         "coverageThresholdLoose": 0.55,
         "looseMinMatched": 6,
+        # 2026-10-27 白名单改「闭集判别」：ratio/jaccard/长度 三分加权 + 阈值 + 领先 margin
+        # 权重在建议值(0.5/0.35/0.15)上微调为 0.55/0.30/0.15：真机噪声「BBB示例测械群」
+        # 标准 Jaccard 只有 0.27，按原权重综合分 0.49 会漏；提高 ratio+length 权重后 0.56 命中，
+        # 而「AAA其他群」仍是 0.54 不命中（正/负样本分离）。
+        "ratioWeight": 0.55,
+        "jaccardWeight": 0.30,
+        "lengthWeight": 0.15,
+        "minComposite": 0.55,
+        "minMargin": 0.12,
+        # 白名单未命中不写 processed_fingerprint，只做 45s 短冷却（避免每轮重复 OCR）
+        "missCooldownSeconds": 45,
+        # 2026-10-27 灰区保险：综合分 0.55~0.65 时先打开会话读标题复核，标题对上才发送
+        "greyZoneLow": 0.55,
+        "greyZoneHigh": 0.65,
     },
     "detect": {
         "windowClass": WECHAT_CLASS,
@@ -201,6 +359,15 @@ DEFAULT_CONFIG = {
         "timeoutSeconds": 25,
         "maxReplyChars": 80,
         "ocrPreview": True,        # 可选：OCR 出会话行里的最近消息文本喂给模型
+        # 2026-10-27 新增：真正送给模型的 incoming 优先取「打开会话后聊天区最后几条气泡」
+        # （列表小字预览容易 OCR 成乱码），拿不到再退回 ocrPreview；只读，不输入不发送。
+        "readChatArea": True,
+        "chatReadMaxBubbles": 3,        # 最多合并最后几条对方消息
+        "chatReadTimeoutSeconds": 60,   # 子进程读聊天区上限
+        # 2026-10-27 多模态升级：把聊天区截图直接发给模型「看图」，OCR 只作参考
+        "visionEnabled": True,
+        "visionModel": "",              # 空 = 用凭据里的 model（deepseek-chat 实际=deepseek-flash）
+        "visionMaxEdge": 1600,          # 图片长边上限，超过先等比缩小再编码
         "sendTimeoutSeconds": 120, # 等 reply.py 真发送的上限
         "forbid": [
             "转账", "汇款", "付款", "红包", "密码", "验证码", "银行卡",
@@ -214,13 +381,28 @@ DEFAULT_CONFIG = {
     "guard": {
         "enabled": True,
         "whitelistOnly": True,              # ① 白名单外绝不发
-        "perChatMinIntervalSeconds": 30,    # ② 同一会话 30 秒内只发 1 条
-        "perChatMaxBurst": 5,               # ③ 同一会话连续 <=5 条 -> 停了等用户发话
+        "perChatMinIntervalSeconds": 4,     # ② 同一会话 4 秒内只发 1 条（2026-10-27 用户要求 3~5s，群聊不卡对话）
+        "perChatMaxBurst": 12,              # ③ 同一会话连续 <=12 条 -> 暂停（防刷屏保险，与腾讯风控无关）
         "burstPauseSeconds": 1800,          #    连续用满后暂停多久
         "burstResetSeconds": 600,           #    和上一条隔这么久算新一段对话（连续计数清零）
         "dedupeSameText": True,             # ④ 同一句话不重复发
-        "dedupeWindowSeconds": 600,         #    去重窗口
+        "dedupeSameTextWindowSeconds": 60,  #    去重短窗（同一会话+完全相同文本，600->60s）
+        "dedupeWindowSeconds": 600,         #    recentTexts 历史保留窗口（供「换说法」禁止清单用）
+        "duplicateRegenAttempts": 2,        #    被 duplicate-text 拦住时换说法重生成的最多次数
         "sentLogEnabled": True,             # ⑤ 每条落 logs/sent-YYYYMMDD.jsonl
+    },
+    # ── 限流排队补发（2026-10-27 用户实测修复）──
+    #    同一会话在冷却期内的新消息不再丢弃：入队 pending_replies.json，
+    #    冷却结束后把多条合并成一次 LLM 生成 + 一次发送；过期/失败有上限与日志。
+    #    （防刷屏的 perChatMaxBurst=12 / burstPauseSeconds=1800 / dedupeSameText 不变；
+    #      达到上限被跳过时也入队，暂停结束合并补发、过期则丢弃并记日志）
+    "pendingQueue": {
+        "enabled": True,
+        "ttlSeconds": 600,          # 排队消息最长存活 10 分钟，过期丢弃并记日志
+        "maxTexts": 5,              # 一个会话最多合并几条（满了丢最旧）
+        "retryAfterSeconds": 20,    # 合并回复生成/发送失败后的重试间隔
+        "maxAttempts": 3,           # 合并回复最多尝试次数，用满则丢弃并记日志
+        "logWaitEverySeconds": 15,  # 「已排队 N 条，等待冷却」日志节流
     },
     # ── 熔断（2026-10-27 第一阶段，用户拍板：连续失败 3 次自动急停，不再往微信发告警）──
     #   达标 -> 写 breaker_tripped.json -> 写 STOP -> 结束 watcher 自身进程 -> Windows 气泡通知
@@ -258,7 +440,7 @@ DEFAULT_CONFIG = {
             "1) 只有白名单命中的会话才允许回复；黑名单/未命中会话只记录。\n"
             "2) autoSend=true 时，请用下面这条命令**实际发送**回复（脚本会自动找会话、输入、发送，\n"
             "   并保存发送前后截图和 OCR 校验结果；只用一次，不要重复发）：\n"
-            "   python \"reply.py\" --chat \"<命中的会话显示名>\" --text \"<回复内容>\"\n"
+            "   E:\\anaconda\\python.exe \"E:\\deepseek harness\\_tools\\wechat-bot\\reply.py\" --chat \"<命中的会话显示名>\" --text \"<回复内容>\"\n"
             "   不要点「标记已读」、不要删除/清理任何消息。\n"
             "3) autoSend=false：只拟回复草稿，等用户确认，绝不自己发送。\n"
             "输出：① 谁发的 ② 要点 ③ 是否已发送（贴 reply.py 打印的截图路径与 OCR 校验结果）。"
@@ -268,9 +450,7 @@ DEFAULT_CONFIG = {
     #    来信含触发词「小耳朵」+ 正确密码（L1/L2）才会转告本机 Agent；
     #    只存 sha256(salt+password)，config/日志/审计里不出现明文密码。
     "remote": {
-        # 🔴 公开版安全默认：远程指令（微信消息 -> 操作电脑）默认关闭。
-        #    开启前必须先用 tools/setup_password.py 生成两级密码，并只把可信会话放进白名单。
-        "enabled": False,
+        "enabled": True,
         "triggerWord": "小耳朵",
         "levels": {},                    # config.json 里填 {L1:{salt,sha256,label,allow}, L2:{...}}
         "pendingTtlSeconds": 180,
@@ -402,6 +582,63 @@ def save_state(state):
         os.replace(tmp, STATE_PATH)
     except Exception as exc:
         log_warn("state.json 写入失败: %s" % exc)
+
+
+# ───────────────────── 限流排队补发（2026-10-27 用户实测修复） ─────────────────────
+# 旧 bug：sendguard 返回 per-chat-interval 时，调用方仍写 processed_fingerprint
+#   -> 那条消息被判定"已处理"，永久漏回。
+# 现在：限流跳过 -> 入队 pending_replies.json（不写 processed_fingerprint），
+#   watcher 每轮检查冷却，冷却结束把同会话多条消息合并成一次生成 + 一次发送。
+
+def pending_queue_load(path=None):
+    """读 pending_replies.json。结构：
+    {"version":1, "updatedAt":"...", "chats": {<norm(chat)>: {
+        "chat": 会话真名, "display": 显示名, "firstSeenAt": ts, "lastSeenAt": ts,
+        "expireAt": ts, "fingerprint": 首个未读指纹, "fingerprints": [...],
+        "texts": [{"incoming":对方原文, "fingerprint":fp, "at":ts, "queuedAtLocal":"..."}],
+        "attempts": n, "nextTryAt": ts, "lastWaitLogAt": ts}}}
+    """
+    path = path or PENDING_REPLY_PATH
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            doc = json.load(f)
+    except Exception:
+        doc = {}
+    if not isinstance(doc, dict):
+        doc = {}
+    doc.setdefault("version", 1)
+    chats = doc.get("chats")
+    if not isinstance(chats, dict):
+        chats = {}
+    doc["chats"] = chats
+    return doc
+
+
+def pending_queue_save(doc, path=None):
+    """写 pending_replies.json（UTF-8 无 BOM；先 tmp 再 replace）。"""
+    path = path or PENDING_REPLY_PATH
+    try:
+        out = dict(doc or {})
+        out["version"] = int(out.get("version") or 1)
+        out["updatedAt"] = _ts()
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+        return True
+    except Exception as exc:
+        log_warn("[QUEUE] pending_replies.json 写入失败: %s" % exc)
+        return False
+
+
+def pending_queue_summary(doc=None):
+    """返回 (会话数, 排队消息条数)。"""
+    doc = doc if isinstance(doc, dict) else pending_queue_load()
+    chats = doc.get("chats") or {}
+    n_chats = len([1 for _k, v in chats.items() if isinstance(v, dict)])
+    n_texts = sum(len((v or {}).get("texts") or []) for v in chats.values() if isinstance(v, dict))
+    return n_chats, n_texts
 
 
 # ───────────────────── 熔断 / 急停（2026-10-27 第一阶段） ─────────────────────
@@ -907,12 +1144,7 @@ def find_tesseract(explicit=""):
     env = os.environ.get("TESSERACT_BIN", "")
     if env:
         cands.append(env)
-    # 常见安装位置（用户级 / 系统级），也支持 TESSERACT_BIN 环境变量或 PATH 里的 tesseract
-    for base, sub in ((os.environ.get("LOCALAPPDATA"), os.path.join("Programs", "Tesseract-OCR")),
-                      (os.environ.get("ProgramFiles"), "Tesseract-OCR"),
-                      (os.environ.get("ProgramFiles(x86)"), "Tesseract-OCR")):
-        if base:
-            cands.append(os.path.join(base, sub, "tesseract.exe"))
+    cands.append(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
     which = shutil.which("tesseract")
     if which:
         cands.append(which)
@@ -966,6 +1198,8 @@ def _ocr_prep(crop_rgb, mode, use_bbox):
             x0, y0, x1, y1 = bb
             pad = 5
             gray = gray[max(0, y0 - pad):y1 + pad, max(0, x0 - pad):x1 + pad]
+    if mode == "plain1x":
+        return cv2.copyMakeBorder(gray, 8, 8, 8, 8, cv2.BORDER_CONSTANT, value=0)
     if mode == "plain2x":
         g = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_LANCZOS4)
         return cv2.copyMakeBorder(g, 16, 16, 16, 16, cv2.BORDER_CONSTANT, value=0)
@@ -1029,10 +1263,49 @@ def _ocr_row_name_candidates(pil_img, geom, row_idx, tesseract, ocr_cfg):
     return out
 
 
+def _union_texts(texts):
+    """多遍 OCR 结果做「字符并集（去重保序）」，用于补不同 PSM 各丢的字。"""
+    out = []
+    for t in texts or []:
+        for ch in str(t or ""):
+            if ch.isspace():
+                continue
+            if ch not in out:
+                out.append(ch)
+    return "".join(out)
+
+
+def _pick_consensus_text(cands):
+    """从多遍 OCR 候选里选「和其他候选最像」的那一条（多数一致），全不一致时取最长。"""
+    items = [str(c or "").strip() for c in (cands or []) if str(c or "").strip()]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    best, best_score = items[0], -1.0
+    for i, a in enumerate(items):
+        score = 0.0
+        for j, b in enumerate(items):
+            if i == j:
+                continue
+            try:
+                score += difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
+            except Exception:
+                pass
+        if score > best_score or (abs(score - best_score) < 1e-6 and len(a) > len(best)):
+            best, best_score = a, score
+    return best
+
+
 def _ocr_row_preview(pil_img, geom, row_idx, tesseract, ocr_cfg):
     """OCR 会话行「最近消息预览」（名字下面那一行），给生成回复当「对方说了什么」。
 
-    可选功能：OCR 失败/取不到就返回空串，由调用方退化成「只知道有新消息」。
+    2026-10-27 用户实测升级：旧版「逐个 plan 取第一个非空」会把小字读成乱码
+    （实测「在吗/今晚吃什么/火锅还是烧烤」被读成「天钠还十距闭」）。
+    现在对齐 reply.py 下拉行那套：**2~3 倍放大 + 多 PSM（6/7/11）多预处理**，
+    行级做「字符并集 + 共识选择」，并保留原始未放大结果做对照。
+
+    返回 {"text": 最佳文本, "variants": [...], "big": [...], "orig": [...]}。
     """
     s = geom["scale"]
     W, H = pil_img.size
@@ -1042,11 +1315,17 @@ def _ocr_row_preview(pil_img, geom, row_idx, tesseract, ocr_cfg):
     row_h = int(round(geom["row_h"] * s))
     top = rows_top + row_idx * row_h
     box = (lx0 + int(62 * s), top + int(40 * s), lx1 - int(14 * s), top + int(62 * s))
-    plans = [(box, "plain2x", 7), (box, "bin3x", 7), (box, "norm3x", 7)]
-    out = ""
+    plans = [
+        (box, "norm3x", True, 6),
+        (box, "bin3x", True, 6),
+        (box, "plain2x", False, 7),
+        (box, "norm3x", True, 11),    # 稀疏文字
+        (box, "plain1x", False, 6),   # 原始未放大（对照）
+    ]
     lang = ocr_cfg.get("lang", "chi_sim")
     timeout_ms = int(ocr_cfg.get("timeoutMs", 10000))
-    for bx, mode, psm in plans:
+    texts, big, orig = [], [], []
+    for bx, mode, use_bbox, psm in plans:
         bx0 = max(0, min(W, bx[0]))
         by0 = max(0, min(H, bx[1]))
         bx1 = max(0, min(W, bx[2]))
@@ -1054,20 +1333,130 @@ def _ocr_row_preview(pil_img, geom, row_idx, tesseract, ocr_cfg):
         if bx1 - bx0 < 10 or by1 - by0 < 8:
             continue
         try:
-            arr = _ocr_prep(pil_img.crop((bx0, by0, bx1, by1)), mode, True)
+            arr = _ocr_prep(pil_img.crop((bx0, by0, bx1, by1)), mode, use_bbox)
         except Exception:
             continue
         if arr is None:
             continue
-        txt = _tess_run(arr, psm, tesseract, lang, timeout_ms)
-        if txt:
-            out = txt.strip()
-            if out:
-                break
-    # 去掉常见的纯符号/时间噪声
-    if not re.search(r"[\w\u4e00-\u9fff]", out or ""):
+        txt = (_tess_run(arr, psm, tesseract, lang, timeout_ms) or "").strip()
+        if not txt:
+            continue
+        texts.append(txt)
+        (orig if mode == "plain1x" else big).append(txt)
+    if not texts:
+        return {"text": "", "variants": [], "big": [], "orig": []}
+    union = _union_texts(big or texts)
+    best = _pick_consensus_text(big or texts)
+    if union and (not best or len(union) > len(best)):
+        # 并集通常能把不同 PSM 各丢的字补回来；只在它更长时采用（避免把顺序打乱的结果当正解）
+        best = union
+    variants = []
+    for t in texts:
+        if t not in variants:
+            variants.append(t)
+    if union and union not in variants:
+        variants.append(union)
+    if not re.search(r"[\w\u4e00-\u9fff]", best or ""):
+        best = ""
+    return {"text": best[:120], "variants": variants[:8], "big": big[:6], "orig": orig[:4]}
+
+
+# ───────────── OCR 文本质量判据（2026-10-27：不让模型对着乱码自由发挥） ─────────────
+# 判据（简单、可解释）：
+#   ① 有效字符（中文/字母/数字/常用标点）占比过低 -> 乱码；
+#   ② 多遍 OCR 候选之间一致性太低（最大两两相似度 < 0.5）-> 不可靠；
+#   ③ 较长的纯中文串里一个常见功能字都没有（乱码典型特征，如「天钠还十距闭」）-> 不可靠；
+#   ④ 大量孤立单字（空格分隔）-> 分割失败。
+_COMMON_CJK = set(
+    "的了是在我你他她它们吗吧啊呢嗯哦好不没这那有要就也都还得地着过和与或但而如果因为所以"
+    "什么怎么哪谁几点早晚今天明天现在可以来去说道看想吃喝玩乐一样个大小多少时候一下吧嘛呀嘿哈额"
+)
+_COMMON_PUNCT = set("，。！？、；：（）【】《》“”‘’…—～·,.!?;:()[]{}<>\"'%-/\\*_+=@#&$^~ `")
+
+# 高频汉字（约 500 个）：用于「严格模式」下判断小字 OCR 结果是否大量非常用字。
+# 只对「会话列表预览」这种已知质量差的来源启用（聊天区气泡字号大，不做此限制，
+# 以免把带生僻字/菜名/人名的正常消息误判成低置信度）。
+_HF_CJK = set(
+    "的一是了我不人在他有这上们来到时大地为子中你说生国年着就那和要她出也得里后自以会家可下而过天"
+    "去能对小多然于心学么之都好看起发当没成只如事把还用第样道想作种开美总从无情己面最女但现前些"
+    "所同日手又行意动方期它头经长儿回位分爱老因很给名法间斯知世什两次使身者被高已亲其进此话常与活"
+    "正感见明问力理尔点文几定本公特做外孩相西果走将月十实向声车全信重三机工物气每并别真打太新比才"
+    "便夫再书部水像眼等体却加电主界门利海受听表德少克代员许稱先口由死安写性马光白或住难望教命花结"
+    "乐色更拉东神记处让母父应直字场平报友关放至张认接告入笑内英军候民岁往何度山觉路带万男边风解叫"
+    "任金快原吃妈变通师立象数四失满战远格士音轻目条呢病始达深完今提求清王化空业思切怎非找片罗钱吗"
+    "语元喜曾离飞科言干流欢约各即指合反题必该论交终林请医晚制球决传画保读运及则房早院量苦火布品近"
+    "坐产答星精视五连司巴奇管类未朋且婚台夜青北队久乎越观落尽形影红爸百令周吧识步希亚术留市半热送"
+    "兴造谈容极随演收首根讲整式取照办强石古华拿计您装似足双妻尼转诉米称丽客南领节衣站黑刻统断福城"
+    "故历惊脸选包紧争另建维绝树系伤示愿持千史谁准联妇纪基买志静阿诗独复痛消社算义竟确酒需单治卡幸"
+    "兰念举仅钟怕共毛句息功官待究跟穿室易游程号居考突皮哪费倒价图具刚脑永歌响商礼细专黄块脚味灵改"
+    "据般破引食仍存众注笔甚某示请嗯哦啊呀嘛呗咋啥啦嘿哈哎唉欸诶哇噢喔嗯哼唔"
+    "锅烧烤鱼肉菜米面粉汤粥茶酒水果瓜豆鸡鸭鹅猪牛羊虾蟹蛋奶糖盐油醋辣酸甜咸香臭鲜活熟冷热冰烫软硬"
+    "今明昨早晚午下午夜凌晨周末星期号点分秒岁块毛元钱个位只条张件套台辆车船机票卡码"
+)
+
+def ocr_text_quality(text, variants=None, strict_raw=False):
+    """判断 OCR 文本是否「可信到可以喂给模型」。返回 (ok: bool, reason: str)。
+
+    variants 传入多遍 OCR 候选时，会额外检查候选间一致性。
+    strict_raw=True 时额外要求「常用字占比」达标 —— 只对会话列表小字预览这种已知质量差的
+    来源启用，用来拦住「天钠还十距闭」这类「每个字都认识、连起来完全不像句子」的乱码。
+    """
+    s = str(text or "").strip()
+    if not s:
+        return False, "empty"
+    if len(s) > 200:
+        return False, "too-long"
+    chars = [c for c in s if not c.isspace()]
+    if not chars:
+        return False, "blank"
+    cjk = [c for c in chars if "\u4e00" <= c <= "\u9fff"]
+    ascii_alnum = [c for c in chars if c.isascii() and c.isalnum()]
+    common = [c for c in chars if c in _COMMON_PUNCT]
+    valid_ratio = (len(cjk) + len(ascii_alnum) + len(common)) / float(len(chars))
+    if valid_ratio < 0.75:
+        return False, "garbage-chars(%.2f)" % valid_ratio
+    # 多遍 OCR 一致性
+    vs = [str(v or "").strip() for v in (variants or []) if str(v or "").strip()]
+    if len(vs) >= 2:
+        best_sim = 0.0
+        for i, a in enumerate(vs):
+            for b in vs[(i + 1):]:
+                try:
+                    best_sim = max(best_sim, difflib.SequenceMatcher(None, a, b, autojunk=False).ratio())
+                except Exception:
+                    pass
+        if best_sim < 0.5:
+            return False, "low-agreement(%.2f)" % best_sim
+    # 较长的纯中文串里完全没有常见功能字（乱码典型）
+    if len(cjk) >= 5 and len(cjk) / float(len(chars)) >= 0.9:
+        if not (set(cjk) & _COMMON_CJK) and len(set(cjk)) >= max(4, int(len(cjk) * 0.7)):
+            return False, "no-common-chars"
+    # 大量孤立单字 -> 分割失败
+    parts = [p for p in re.split(r"\s+", s) if p]
+    if len(parts) >= 4:
+        single = sum(1 for p in parts if len(p) == 1)
+        if single / float(len(parts)) >= 0.6:
+            return False, "isolated-chars"
+    # 严格模式（仅小字预览）：中文里「常用高频字」占比过低 -> 疑似乱码
+    if strict_raw and len(cjk) >= 4:
+        hf = sum(1 for c in cjk if c in _HF_CJK)
+        ratio = hf / float(len(cjk))
+        if ratio < 0.6:
+            return False, "rare-chars(%.2f)" % ratio
+    return True, "ok"
+
+
+def merge_incoming_texts(texts):
+    """把同一会话连发的多条对方消息拼成给模型的上下文（只回一条）。"""
+    items = [str(t or "").strip() for t in (texts or []) if str(t or "").strip()]
+    if not items:
         return ""
-    return out[:120]
+    if len(items) == 1:
+        return items[0]
+    lines = ["对方刚连发 %d 条：" % len(items)]
+    for i, x in enumerate(items, 1):
+        lines.append("%d. %s" % (i, x))
+    return "\n".join(lines)
 
 
 def normalize_name(text):
@@ -1181,8 +1570,136 @@ def name_match(candidates, names, match_cfg=None):
     return res
 
 
-# 兼容旧调用名
-whitelist_match = name_match
+# ───────────────── 白名单闭集判别（2026-10-27 用户实测：OCR 噪声导致「时灵时不灵」） ─────────────────
+# 背景：旧 name_match 是 prefix/包含式匹配，OCR 把「BBB示例测试群」读成「BBB示例测械群」就 miss，
+#   同一条群一会能回一会不能回；miss 后又写 processed_fingerprint -> 永久漏回。
+# 现在：白名单只有几项（闭集），对「每个 OCR 候选 × 每个白名单项」打分取最高：
+#   ratio=difflib.SequenceMatcher.ratio, jaccard=去重字符集交并比, length=1-|len差|/max(len)
+#   综合分 = 0.50*ratio + 0.35*jaccard + 0.15*length（权重可配）；
+#   最高分 >= minComposite(0.55) 且领先第二名 >= minMargin(0.12) 才算命中，否则 miss。
+
+
+def _wl_norm(s):
+    """白名单匹配归一化：normalize_name（全角转半角/小写/去省略号）后再只保留中文/字母/数字。"""
+    s = normalize_name(s)
+    return "".join(ch for ch in s if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
+
+
+def _wl_weights(match_cfg=None):
+    cfg = match_cfg or {}
+
+    def _f(key, default):
+        try:
+            return float(cfg.get(key, default))
+        except Exception:
+            return float(default)
+
+    return {"ratioWeight": _f("ratioWeight", 0.55),
+            "jaccardWeight": _f("jaccardWeight", 0.30),
+            "lengthWeight": _f("lengthWeight", 0.15),
+            "minComposite": _f("minComposite", 0.55),
+            "minMargin": _f("minMargin", 0.12)}
+
+
+def whitelist_entry_score(candidate, item, weights=None):
+    """单个 OCR 候选 vs 单个白名单项 -> {ratio, jaccard, length, score}。"""
+    w = weights or _wl_weights()
+    a, b = _wl_norm(candidate), _wl_norm(item)
+    if not a or not b:
+        return {"ratio": 0.0, "jaccard": 0.0, "length": 0.0, "score": 0.0,
+                "normCandidate": a, "normItem": b}
+    try:
+        ratio = difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
+    except Exception:
+        ratio = 0.0
+    sa, sb = set(a), set(b)
+    jac_std = (len(sa & sb) / float(len(sa | sb))) if (sa | sb) else 0.0
+    # OCR 噪声下标准 Jaccard 会偏低（漏字/错字都进并集分母）。额外算「字符集包含度」
+    #   overlap = |交集| / min(|A|,|B|)（交集占较小集合的比例），取两者较大者做子分 2。
+    overlap = (len(sa & sb) / float(min(len(sa), len(sb)))) if (sa and sb) else 0.0
+    jac = max(jac_std, overlap)
+    length = 1.0 - abs(len(a) - len(b)) / float(max(len(a), len(b)))
+    score = (w["ratioWeight"] * ratio + w["jaccardWeight"] * jac
+             + w["lengthWeight"] * length)
+    return {"ratio": round(ratio, 4), "jaccard": round(jac, 4),
+            "jaccardStd": round(jac_std, 4), "overlap": round(overlap, 4),
+            "length": round(length, 4), "score": round(score, 4),
+            "normCandidate": a, "normItem": b}
+
+
+def whitelist_match(candidates, whitelist, match_cfg=None):
+    """闭集白名单匹配：每候选×每白名单项打分取最高，最高分与 margin 同时达标才命中。
+
+    返回 dict：hit/matched/display/normalized/score/secondScore/margin/parts/reason/ranking。
+    日志用 format_whitelist_ranking() 打印每项的 ratio/jaccard/length/综合分。
+    """
+    w = _wl_weights(match_cfg)
+    items = [str(x).strip() for x in (whitelist or []) if str(x).strip()]
+    cands = []
+    for raw in (candidates or []):
+        c = _clean_candidate(raw)
+        if len(_wl_norm(c)) >= 2 and c not in cands:
+            cands.append(c)
+    res = {"hit": False, "matched": "", "display": "", "normalized": "",
+           "score": 0.0, "secondScore": 0.0, "margin": 0.0, "parts": {},
+           "reason": "", "ranking": [], "candidates": list(cands),
+           "whitelistEmpty": not items}
+    if not items:
+        res["reason"] = "whitelist-empty"
+        return res
+    if not cands:
+        res["reason"] = "no-ocr-candidate"
+        return res
+    # 每个白名单项：取所有 OCR 候选里的最高分（多候选全部用上）
+    best_by_item = []
+    for item in items:
+        best = None
+        for cand in cands:
+            sc = whitelist_entry_score(cand, item, w)
+            if best is None or sc["score"] > best["score"]:
+                best = dict(sc, item=item, candidate=cand)
+        best_by_item.append(best)
+    best_by_item.sort(key=lambda x: x["score"], reverse=True)
+    res["ranking"] = best_by_item
+    best = best_by_item[0]
+    second = best_by_item[1] if len(best_by_item) > 1 else {"score": 0.0, "item": ""}
+    display = ""
+    for cand in cands:
+        if len(normalize_name(cand)) > len(normalize_name(display)):
+            display = cand
+    res.update({"display": display, "normalized": normalize_name(display),
+                "score": best["score"], "secondScore": second["score"],
+                "margin": round(best["score"] - second["score"], 4),
+                "matched": best["item"], "parts": best})
+    if best["score"] >= w["minComposite"] and res["margin"] >= w["minMargin"]:
+        res.update({"hit": True, "display": best["candidate"],
+                    "normalized": normalize_name(best["candidate"]),
+                    "reason": "closed-set score=%.2f(ratio=%.2f jac=%.2f len=%.2f) margin=%.2f"
+                              % (best["score"], best["ratio"], best["jaccard"],
+                                 best["length"], res["margin"])})
+    else:
+        res["reason"] = ("below-threshold score=%.2f<%.2f or margin=%.2f<%.2f"
+                         % (best["score"], w["minComposite"],
+                            res["margin"], w["minMargin"]))
+    return res
+
+
+def format_whitelist_ranking(res, max_items=8):
+    """把闭集判别结果格式化成一行日志：'条目'=综合分(ratio/jac/len)。"""
+    parts = []
+    for r in (res.get("ranking") or [])[:max_items]:
+        if not isinstance(r, dict):
+            continue
+        parts.append("'%s'=%.2f(ratio=%.2f jac=%.2f/std=%.2f,ovl=%.2f len=%.2f)"
+                     % (str(r.get("item") or "")[:24], float(r.get("score") or 0),
+                        float(r.get("ratio") or 0), float(r.get("jaccard") or 0),
+                        float(r.get("jaccardStd") or 0), float(r.get("overlap") or 0),
+                        float(r.get("length") or 0)))
+    return "；".join(parts) if parts else "(无)"
+
+
+# 兼容旧调用名（保留旧 prefix 匹配给黑名单 / 单条 hint 用）
+whitelist_match_legacy = name_match
 
 
 def analyze_window(bgr, scale):
@@ -1463,7 +1980,7 @@ class DshRpc:
     def _get_cookie(self):
         """每次调用都重新读 .credentials.yaml 并重新铸造 Cookie（禁用缓存）。
 
-        原因：DSH 重启/重建凭据后 browser-session 密钥可能变化，缓存旧 Cookie 会得到 401；
+        原因：Orb 重启/重建凭据后 browser-session 密钥可能变化，缓存旧 Cookie 会得到 401；
         铸造是纯本地 HMAC，成本可忽略，唤醒频率也低。
         """
         secret, err = read_browser_session_secret(self.dsh_home)
@@ -1582,8 +2099,8 @@ REMOTE_PROMPT_TEMPLATE = (
     "\n"
     "你现在被微信唤起来当\"远程操作员\"。请在这台电脑上完成上面的请求，然后把结果发回微信。\n"
     "发回方式（只能用这两个脚本，不要自己开微信窗口乱点）：\n"
-    "  文本： python \"{reply_py}\" --chat \"{chat}\" --text \"<内容>\"\n"
-    "  文件： python \"{send_py}\" --chat \"{chat}\" --file \"<绝对路径>\"\n"
+    "  文本： E:\\anaconda\\python.exe \"E:\\deepseek harness\\_tools\\wechat-bot\\reply.py\" --chat \"{chat}\" --text \"<内容>\"\n"
+    "  文件： E:\\anaconda\\python.exe \"E:\\deepseek harness\\_tools\\wechat-bot\\sendfile.py\" --chat \"{chat}\" --file \"<绝对路径>\"\n"
     "硬性要求：\n"
     "1. 只发用户点名要的东西；绝不发 .credentials*、*key*、密码/令牌类文件。\n"
     "2. 不要批量外发、不要发整个磁盘目录。\n"
@@ -1729,7 +2246,6 @@ def build_remote_prompt(remote_cfg, chat, text, level):
     prompt = REMOTE_PROMPT_TEMPLATE.format(
         chat=chat, time=time.strftime("%Y-%m-%d %H:%M:%S"),
         text=redact_known_password(text), level=level, label=label,
-        reply_py=REPLY_PY_PATH, send_py=SEND_PY_PATH,
         allow=", ".join(str(a) for a in allow))
     if level == "L2":
         prompt += ("\n本次为二级授权（L2）：允许执行命令与文件修改/删除/安装/启动停止程序等 "
@@ -1773,6 +2289,53 @@ def remote_state_save(state, path=None):
         return False
 
 
+def trigger_match(text, trigger_word):
+    """触发词模糊识别（2026-10-27：OCR 把「小耳朵」读成「小耳洲」导致远程指令被当闲聊）。
+
+    三种命中方式（满足任一即算触发）：
+      ① exact   ：原文含触发词「小耳朵」（原逻辑）；
+      ② fuzzy   ：触发词前两字 + 任意一个汉字（小耳洲/小耳朱/小耳采/小耳杂…）；
+      ③ coverage：从触发词首字起算的**前缀字符覆盖率** >= 0.67（如只认对前两字「小耳」+ 末字错/缺）。
+    反例必须不命中：大耳朵图图 / 小猫耳朵 / 今晚吃什么（首字不是「小」或不满足覆盖率）。
+
+    返回 (hit: bool, source: str, snippet: str, pos: int)。只做判定，不涉及密码校验。
+    """
+    t = str(text or "")
+    trig = str(trigger_word or "小耳朵").strip()
+    if not t or not trig:
+        return False, "", "", -1
+    pos = t.find(trig)
+    if pos >= 0:
+        return True, "exact", t[pos:pos + 14], pos
+    # ② fuzzy：前两字 + 任意一个汉字（覆盖末字被 OCR 读错的情况）
+    if len(trig) >= 3:
+        try:
+            pat = re.compile(re.escape(trig[:2]) + r"[\u4e00-\u9fa5]")
+            m = pat.search(t)
+        except Exception:
+            m = None
+        if m:
+            return True, "fuzzy(%s)" % m.group(0), t[max(0, m.start()):m.start() + 14], m.start()
+    # ③ 前缀覆盖率：必须是触发词首字开头的近似（避免「大耳朵图图」「小猫耳朵」误触）
+    need = 0.67
+    start = 0
+    while True:
+        i = t.find(trig[0], start)
+        if i < 0:
+            break
+        lcp = 0
+        for a, b in zip(trig, t[i:]):
+            if a != b:
+                break
+            lcp += 1
+        cov = lcp / float(len(trig))
+        # 2/3=0.6667 四舍五入即 0.67，按两位小数比较（覆盖「小耳」+空格/标点这种只认对前两字的情况）
+        if round(cov, 2) >= need:
+            return True, "coverage=%.2f" % cov, t[i:i + 14], i
+        start = i + 1
+    return False, "", "", -1
+
+
 def remote_plan(chat, text, remote_cfg, state, now=None):
     """远程指令状态机（纯决策，不执行 RPC、不发消息）。返回 plan dict。
 
@@ -1794,7 +2357,8 @@ def remote_plan(chat, text, remote_cfg, state, now=None):
     lock_map = state.setdefault("lockouts", {})
     raw = str(text or "").strip()
     plan = {"action": "chat_only", "level": "", "passwordOk": False, "attempts": 0,
-            "command": raw, "reply_text": "", "prompt": "", "audit": False}
+            "command": raw, "reply_text": "", "prompt": "", "audit": False,
+            "triggerHit": False, "triggerSource": "", "triggerSnippet": ""}
     if not cfg.get("enabled"):
         return plan
     # 0) 锁死检查
@@ -1812,10 +2376,16 @@ def remote_plan(chat, text, remote_cfg, state, now=None):
     if pend and (now - float(pend.get("createdAt") or 0)) > ttl:
         pending_map.pop(chat, None)
         pend = {}
-    has_trigger = bool(trigger and trigger in raw)
-    # 2) 一条到位：含触发词 + 含任一级别密码
+    # 2026-10-27：触发词改模糊识别（exact / fuzzy(小耳X) / coverage>=0.67），不再要求精确字符串
+    trigger_hit, trigger_src, trigger_snippet, trigger_pos = trigger_match(raw, trigger)
+    has_trigger = bool(trigger_hit)
+    plan.update({"triggerHit": has_trigger, "triggerSource": trigger_src,
+                 "triggerSnippet": trigger_snippet})
+    # 2) 一条到位：触发词命中 + 含任一级别密码
+    password_level, password_token = "", ""
     if has_trigger:
-        level, token = find_password_in_text(raw, cfg)
+        password_level, password_token = find_password_in_text(raw, cfg)
+        level, token = password_level, password_token
         if level:
             cmd = redact_token(raw, token)
             risk = is_high_risk_text(raw)
@@ -1833,6 +2403,15 @@ def remote_plan(chat, text, remote_cfg, state, now=None):
                          "command": cmd, "audit": True,
                          "prompt": build_remote_prompt(cfg, chat, cmd, level)})
             return plan
+    # 2.5) 2026-10-27：触发词命中但消息里没有有效密码（含密码被 OCR 读错：如「一级 空色: ******」）
+    #      -> 一律走 need_password 挑战-应答，**不当作闲聊、也不计入 wrong_password 次数**。
+    #      让用户单独发一条纯数字密码（短消息 OCR 准得多），而不是静默变普通聊天。
+    if has_trigger and not password_level:
+        cmd = redact_known_password(raw)
+        pending_map[chat] = {"text": cmd, "createdAt": now, "attempts": 0, "levelHint": ""}
+        plan.update({"action": "need_password", "attempts": 0, "command": cmd, "audit": True,
+                     "reply_text": "要做这个得先核对密码，把密码发我（3 分钟内有效）"})
+        return plan
     # 3) 有未过期待办：这条消息当「密码应答」
     if pend:
         attempt_before = int(pend.get("attempts") or 0)
@@ -2000,6 +2579,12 @@ class Watchdog:
         return os.path.exists(STOP_PATH)
 
     # ---- 熔断（2026-10-27 第一阶段） ----
+    def memo_log(self, reason, text, available=None):
+        try:
+            return memo_log(self.config, reason, text, available=available)
+        except Exception as exc:
+            log_warn("[MEMO] ignored: %s" % exc); return False
+
     def _breaker_cfg(self):
         return (self.config or {}).get("breaker") or {}
 
@@ -2028,6 +2613,10 @@ class Watchdog:
             log_info("[BREAKER] 熔断已禁用（breaker.enabled=false）-> 只计数、不熔断")
             return {"tripped": False, "count": count, "limit": limit}
         if count >= limit:
+            try:
+                self.memo_log("breaker", "\u26a0 %d consecutive send failures, auto panic" % count)
+            except Exception:
+                pass
             self._trip_breaker(st, limit, kill=kill)
             return {"tripped": True, "count": count, "limit": limit}
         return {"tripped": False, "count": count, "limit": limit}
@@ -2142,6 +2731,10 @@ class Watchdog:
         """急停统一出口：[PANIC] 日志 + 审计 + 写 STOP + 气泡 -> 结束 watcher 自身进程。"""
         append_panic_log(source, detail)
         log_error("[PANIC] source=%s %s -> 写 STOP 急停文件" % (source, detail))
+        try:
+            self.memo_log("panic", "\u26a0 emergency stop triggered (%s)" % source)
+        except Exception:
+            pass
         ok = write_stop_file("%s %s" % (source, detail))
         if (self.config.get("panic") or {}).get("toast", True):
             try:
@@ -2317,6 +2910,255 @@ class Watchdog:
             return False
         return float(now if now is not None else time.time()) >= float(rs.get("next_try_at") or 0.0)
 
+    # ---- 限流排队补发（2026-10-27：per-chat-interval 不再丢弃消息） ----
+    def _pending_queue_cfg(self):
+        pq = (self.config or {}).get("pendingQueue")
+        return pq if isinstance(pq, dict) else {}
+
+    @staticmethod
+    def _merged_incoming_text(texts):
+        """把同一会话排队的多条对方消息拼成「连发上下文」，让 LLM 只生成一条回复。"""
+        items = [str((t or {}).get("incoming") or "").strip() for t in (texts or [])]
+        items = [x for x in items if x]
+        n = len(texts or [])
+        if not items:
+            return ""
+        if n <= 1:
+            return items[0]
+        lines = ["【对方刚刚连续发来 %d 条消息，请合并理解成一次对话，只回一条自然的回复】" % n]
+        for i, x in enumerate(items, 1):
+            lines.append("%d. %s" % (i, x))
+        return "\n".join(lines)
+
+    def _queue_rate_limited_reply(self, chat, display, incoming, digest, verdict):
+        """护栏命中 per-chat-interval -> 入队等冷却后合并补发；绝不写 processed_fingerprint。
+
+        返回 True = 已入队（或被并发判重）；False = 未排队（调用方应按旧逻辑处理）。
+        """
+        pq = self._pending_queue_cfg()
+        if not pq.get("enabled", True):
+            log_warn("[QUEUE] pendingQueue.enabled=false -> 限流消息不排队（按旧逻辑丢弃）chat=%r" % chat)
+            return False
+        doc = pending_queue_load()
+        chats = doc.setdefault("chats", {})
+        key = sendguard.norm(chat) or str(chat or "?")
+        now = time.time()
+        ttl = float(pq.get("ttlSeconds") or 600)
+        max_texts = max(1, int(pq.get("maxTexts") or 5))
+        item = chats.get(key)
+        if not isinstance(item, dict):
+            item = {"chat": chat, "display": display or "", "firstSeenAt": now,
+                    "lastSeenAt": now, "texts": [], "fingerprints": [],
+                    "attempts": 0, "nextTryAt": 0.0, "lastWaitLogAt": 0.0}
+        item["chat"] = chat
+        if display:
+            item["display"] = display
+        fps = list(item.get("fingerprints") or [])
+        if digest and digest in fps:
+            log_info("[QUEUE] 该未读已在队列中（不重复入队）chat=%r fp=%s 队列=%d 条"
+                     % (chat, digest, len(item.get("texts") or [])))
+            return True
+        texts = list(item.get("texts") or [])
+        if len(texts) >= max_texts:
+            log_warn("[QUEUE] 队列已满（%d 条），丢弃最旧一条后再入队 chat=%r" % (max_texts, chat))
+            texts = texts[-(max_texts - 1):]
+        texts.append({"incoming": str(incoming or "").strip(), "fingerprint": digest,
+                      "at": now, "queuedAtLocal": _ts()})
+        item["texts"] = texts
+        item["fingerprints"] = (fps + ([digest] if digest else []))[-max_texts:]
+        item["firstSeenAt"] = float(item.get("firstSeenAt") or now)
+        item["lastSeenAt"] = now
+        item["expireAt"] = item["firstSeenAt"] + ttl
+        chats[key] = item
+        pending_queue_save(doc)
+        n_chats, n_texts = pending_queue_summary(doc)
+        try:
+            next_at = float((verdict or {}).get("nextAllowedAt") or 0)
+        except Exception:
+            next_at = 0.0
+        wait = max(0.0, next_at - now) if next_at else 0.0
+        log_info("[QUEUE] 已排队 %d 条，等待冷却（chat=%r 本条还需 %.0fs；"
+                 "不写 processed_fingerprint，冷却结束后合并成一条回复）队列总计 %d 会话/%d 条 fp=%s text=%r"
+                 % (len(texts), chat, wait, n_chats, n_texts, digest or "-",
+                    str(texts[-1].get("incoming") or "")[:60]))
+        return True
+
+    def flush_pending_replies(self, info=None):
+        """每轮检查排队消息：冷却已过 -> 合并成一条回复 -> 发送一次 -> 清空该会话队列。
+
+        返回本轮成功发送的会话数。失败有退避与上限；绝不丢弃「还没到冷却」的消息。
+        """
+        pq = self._pending_queue_cfg()
+        if not pq.get("enabled", True):
+            return 0
+        doc = pending_queue_load()
+        chats = doc.get("chats") or {}
+        if not chats:
+            return 0
+        # 微信窗口不可用时先不发（避免连续失败触发熔断）；等窗口恢复下一轮再补
+        if info is not None and not (info or {}).get("available"):
+            return 0
+        if not self.config.get("autoSend"):
+            return 0
+        cfg = self.config
+        now = time.time()
+        ttl = float(pq.get("ttlSeconds") or 600)
+        retry_after = max(1.0, float(pq.get("retryAfterSeconds") or 20))
+        max_attempts = max(1, int(pq.get("maxAttempts") or 3))
+        every = float(pq.get("logWaitEverySeconds") or 15)
+        try:
+            min_int = float((cfg.get("guard") or {}).get("perChatMinIntervalSeconds") or 0)
+        except Exception:
+            min_int = 0.0
+        self.guard_state = sendguard.load_state(GUARD_STATE_PATH)
+        sent_count = 0
+        changed = False
+        for key in list(chats.keys()):
+            item = chats.get(key)
+            if not isinstance(item, dict):
+                chats.pop(key, None)
+                changed = True
+                continue
+            chat = str(item.get("chat") or "").strip()
+            texts = [t for t in (item.get("texts") or []) if isinstance(t, dict)]
+            if not chat or not texts:
+                chats.pop(key, None)
+                changed = True
+                continue
+            first = float(item.get("firstSeenAt") or 0)
+            if first and (now - first) > ttl:
+                log_warn("[QUEUE] 排队消息已过期，丢弃 %d 条（首条在 %.0fs 前，TTL=%.0fs）chat=%r text=%r"
+                         % (len(texts), now - first, ttl, chat,
+                            self._merged_incoming_text(texts)[:80]))
+                chats.pop(key, None)
+                changed = True
+                continue
+            rec = (self.guard_state.get("chats") or {}).get(sendguard.norm(chat)) or {}
+            last_sent = float(rec.get("lastSentAt") or 0)
+            cooldown_wait = max(0.0, (last_sent + min_int) - now)
+            backoff_wait = max(0.0, float(item.get("nextTryAt") or 0) - now)
+            wait = max(cooldown_wait, backoff_wait)
+            if wait > 0:
+                last_log = float(item.get("lastWaitLogAt") or 0)
+                if (now - last_log) >= every:
+                    item["lastWaitLogAt"] = now
+                    changed = True
+                    log_info("[QUEUE] 已排队 %d 条，等待冷却（chat=%r 还需 %.0fs%s）"
+                             % (len(texts), chat, wait,
+                                "" if cooldown_wait > 0 else "（上次合并回复失败，退避中）"))
+                continue
+            # ---------- 冷却结束：合并成一条回复 ----------
+            merged = self._merged_incoming_text(texts)
+            log_info("[QUEUE] 冷却结束，合并回复 %d 条 -> 生成一次并发送 chat=%r text=%s"
+                     % (len(texts), chat,
+                        " | ".join(str(t.get("incoming") or "")[:40] for t in texts)[:160]))
+            gen_cfg = cfg.get("gen") or {}
+            try:
+                gen_res = genreply.generate(gen_cfg, BASE_DIR, chat, merged,
+                                            log_info=log_info, log_warn=log_warn, log_error=log_error)
+            except Exception as exc:
+                gen_res = {"ok": False, "error": "queue-generate-exception: %s" % exc}
+            if not gen_res.get("ok"):
+                item["attempts"] = int(item.get("attempts") or 0) + 1
+                item["nextTryAt"] = now + retry_after
+                changed = True
+                if item["attempts"] >= max_attempts:
+                    log_warn("[QUEUE] 合并回复生成连续失败 %d 次 -> 丢弃队列 chat=%r（最后原因=%s）"
+                             % (item["attempts"], chat, gen_res.get("error")))
+                    chats.pop(key, None)
+                else:
+                    log_warn("[QUEUE] 合并回复生成失败（%s）-> 保留队列，%.0fs 后重试（%d/%d）"
+                             % (gen_res.get("error"), retry_after,
+                                item["attempts"], max_attempts))
+                continue
+            text = str(gen_res.get("text") or "")
+            verdict = sendguard.check(cfg, self.guard_state, chat, text,
+                                      whitelisted=True, now=now)
+            sendguard.save_state(GUARD_STATE_PATH, self.guard_state)
+            if not verdict.get("ok"):
+                skip = str(verdict.get("skip") or "")
+                if skip == "duplicate-text":
+                    log_warn("[QUEUE] 合并回复与近期已发内容重复（%s）-> 丢弃队列 chat=%r text=%r"
+                             % (verdict.get("detail"), chat, text))
+                    chats.pop(key, None)
+                    changed = True
+                    continue
+                item["attempts"] = int(item.get("attempts") or 0) + 1
+                item["nextTryAt"] = max(now + retry_after,
+                                        float(verdict.get("nextAllowedAt") or 0))
+                changed = True
+                if item["attempts"] >= max_attempts:
+                    log_warn("[QUEUE] 合并回复连续被护栏拦下 %d 次（%s）-> 丢弃队列 chat=%r"
+                             % (item["attempts"], verdict.get("detail"), chat))
+                    chats.pop(key, None)
+                else:
+                    log_warn("[QUEUE] 合并回复被护栏拦下（%s: %s）-> 保留队列，%s 后重试"
+                             % (skip or "-", verdict.get("detail"),
+                                time.strftime("%Y-%m-%d %H:%M:%S",
+                                              time.localtime(float(verdict.get("nextAllowedAt")
+                                                                   or (now + retry_after))))))
+                continue
+            send = self._call_reply_py(chat, text)
+            if not send.get("ok"):
+                parsed = send.get("parsed") or {}
+                abort_reason = str(parsed.get("abort") or send.get("error") or "send-not-confirmed")
+                try:
+                    self.breaker_register_failure(abort_reason or "queue-send-failed")
+                except SystemExit:
+                    raise
+                except Exception as exc:
+                    log_error("[QUEUE] 熔断计数异常（忽略）: %s" % exc)
+                item["attempts"] = int(item.get("attempts") or 0) + 1
+                item["nextTryAt"] = now + retry_after
+                changed = True
+                if item["attempts"] >= max_attempts:
+                    log_warn("[QUEUE] 合并回复发送失败 %d 次 -> 丢弃队列 chat=%r（最后原因=%s）"
+                             % (item["attempts"], chat, abort_reason[:120]))
+                    chats.pop(key, None)
+                else:
+                    log_warn("[QUEUE] 合并回复发送失败（%s）-> 保留队列，%.0fs 后重试（%d/%d）"
+                             % (abort_reason[:120], retry_after,
+                                item["attempts"], max_attempts))
+                continue
+            # ---------- 发送成功：记账 + 清空该会话队列 ----------
+            record = send.get("confirmed") or {}
+            fps = item.get("fingerprints") or []
+            fingerprint = str(fps[0] if fps else "")
+            extra = {
+                "display": item.get("display") or chat,
+                "fingerprint": fingerprint,
+                "reason": "queued-merged(%d条)" % len(texts),
+                "gen": {"ok": True, "text": text, "incoming": merged,
+                        "incomingSource": "queued-merged",
+                        "model": gen_res.get("model"),
+                        "latencyMs": gen_res.get("latencyMs")},
+                "model": gen_res.get("model"),
+                "latencyMs": gen_res.get("latencyMs"),
+                "before": record.get("before"), "after": record.get("after"),
+                "elapsed": send.get("elapsed"),
+                "mouse_events": record.get("mouse_events"),
+                "key_events": record.get("key_events"),
+            }
+            sent_item = sendguard.record(cfg, self.guard_state, chat, text,
+                                         fingerprint=fingerprint, extra=extra)
+            sendguard.save_state(GUARD_STATE_PATH, self.guard_state)
+            sent_log = ""
+            if (cfg.get("guard") or {}).get("sentLogEnabled", True):
+                sent_log = sendguard.append_sent_log(LOG_DIR, sent_item)
+            try:
+                self.breaker_register_success()
+            except Exception as exc:
+                log_warn("[QUEUE] 熔断成功计数清零异常（忽略）: %s" % exc)
+            chats.pop(key, None)
+            changed = True
+            sent_count += 1
+            log_info("[QUEUE] 合并回复已发送 chat=%r text=%r（合并 %d 条，发送记录 %s）"
+                     % (chat, text, len(texts), sent_log or "(写失败)"))
+        if changed:
+            doc["chats"] = chats
+            pending_queue_save(doc)
+        return sent_count
+
     @staticmethod
     def _reply_sent_records():
         """读 reply_state.json 的 sent 列表（reply.py 真发送成功后才追加）。"""
@@ -2491,39 +3333,140 @@ class Watchdog:
 
     # ---------- 方案A：生成 + 护栏 + 发送 ----------
     def _recent_message_text(self, info, row):
-        """可选：OCR 会话行里的「最近消息」预览，返回 (text, source)。"""
+        """可选：OCR 会话行里的「最近消息」预览，返回 (text, source, variants)。
+
+        2026-10-27：升级为「2~3 倍放大 + 多 PSM + 并集/共识」，日志同时打印放大/原始对照。
+        """
         gen_cfg = self.config.get("gen") or {}
         if not gen_cfg.get("ocrPreview", True):
-            return "", "disabled"
+            return "", "disabled", []
         if not info or info.get("img") is None or not info.get("geom"):
-            return "", "no-image"
+            return "", "no-image", []
         ocr_cfg = self.config.get("ocr") or {}
         if not ocr_cfg.get("enabled", True):
-            return "", "ocr-disabled"
+            return "", "ocr-disabled", []
         if self._tesseract is None:
             self._tesseract = find_tesseract(ocr_cfg.get("tesseract", ""))
         if not self._tesseract:
             log_warn("%s OCR 不可用（找不到 tesseract）-> 只把会话名告诉模型" % genreply.GEN_TAG)
-            return "", "no-tesseract"
+            return "", "no-tesseract", []
         row_idx = int(row.get("row", 0) or 0)
         try:
-            txt = _ocr_row_preview(info["img"], info["geom"], row_idx,
+            res = _ocr_row_preview(info["img"], info["geom"], row_idx,
                                    self._tesseract, ocr_cfg)
         except Exception as exc:
             log_warn("%s 预览 OCR 失败: %s" % (genreply.GEN_TAG, exc))
-            return "", "ocr-error"
+            return "", "ocr-error", []
+        txt = str(res.get("text") or "").strip()
+        big = [t for t in (res.get("big") or []) if t]
+        orig = [t for t in (res.get("orig") or []) if t]
+        if big or orig:
+            log_info("%s OCR 对方最近消息(放大)='%s' 原始='%s'（row=%s 多遍=%d）" % (
+                genreply.GEN_TAG, " | ".join(big)[:120], " | ".join(orig)[:120],
+                row_idx, len(res.get("variants") or [])))
         if txt:
-            log_info("%s OCR 对方最近消息: %r（row=%s）" % (genreply.GEN_TAG, txt, row_idx))
-            return txt, "ocr"
-        log_info("%s OCR 未取到对方消息文本（row=%s）-> 只告诉模型「对方发来了新消息」"
+            return txt, "ocr-preview", list(res.get("variants") or [])
+        log_info("%s OCR 未取到对方消息文本（row=%s）-> 交给聊天区读取/低置信度兜底"
                  % (genreply.GEN_TAG, row_idx))
-        return "", "empty"
+        return "", "empty", []
+
+    def _read_chat_incoming(self, chat, gen_cfg=None, force=False):
+        """打开会话后只读地读取「聊天区最后几条对方消息」（reply.py --read-msg）。
+
+        2026-10-27 多模态：额外传 --crop-out，让 reply.py 把聊天区底部区域存成 PNG，
+        返回 {"crop": path, "cropSize": [w,h]}，供 watcher 直接发给多模态模型看图。
+        force=True 时忽略 readChatArea 配置（灰区标题复核需要强制打开会话读标题）。
+
+        2026-10-27 用户实测：会话列表预览是小字，OCR 常读成乱码；聊天区气泡字号大、
+        背景干净，读得准。这里以子进程方式复用 reply.py 的打开会话+OCR 流程；
+        只读：不开输入框、不输入、不按 Enter。失败返回 {"ok": False}，由调用方回退列表预览。
+        """
+        gen_cfg = gen_cfg or (self.config.get("gen") or {})
+        if not gen_cfg.get("readChatArea", True) and not force:
+            return {"ok": False, "texts": [], "error": "readChatArea=false"}
+        max_b = max(1, min(5, int(gen_cfg.get("chatReadMaxBubbles") or 3)))
+        timeout = max(10.0, float(gen_cfg.get("chatReadTimeoutSeconds") or 60))
+        vision_on = bool(gen_cfg.get("visionEnabled", True))
+        crop_path = ""
+        if vision_on:
+            try:
+                shot_dir = os.path.join(BASE_DIR, "screenshots")
+                os.makedirs(shot_dir, exist_ok=True)
+                crop_path = os.path.join(shot_dir, "chatcrop-%s-%s.png" % (
+                    time.strftime("%Y%m%d-%H%M%S"), uuid.uuid4().hex[:6]))
+            except Exception:
+                crop_path = ""
+        python = sys.executable or "python"
+        cmd = [python, REPLY_PY_PATH, "--read-msg", "--chat", chat,
+               "--max-bubbles", str(max_b)]
+        if crop_path:
+            cmd += ["--crop-out", crop_path]
+        log_info("[READ] 打开会话读取聊天区最后 %d 条对方消息（reply.py --read-msg，只读：不输入、不发发送）"
+                 " chat=%r timeout=%.0fs" % (max_b, chat, timeout))
+        t0 = time.time()
+        try:
+            proc = subprocess.run(cmd, cwd=BASE_DIR, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", timeout=timeout,
+                                  creationflags=0x08000000)
+            out = proc.stdout or ""
+        except subprocess.TimeoutExpired:
+            log_warn("[READ] reply.py --read-msg 超时（%.0fs）-> 回退列表预览" % timeout)
+            return {"ok": False, "texts": [], "error": "timeout"}
+        except Exception as exc:
+            log_warn("[READ] reply.py --read-msg 调用失败: %s -> 回退列表预览" % exc)
+            return {"ok": False, "texts": [], "error": str(exc)}
+        elapsed_ms = int((time.time() - t0) * 1000)
+        doc = None
+        for line in reversed((out or "").strip().splitlines()):
+            line = line.strip()
+            if line.startswith("{") and line.endswith("}"):
+                try:
+                    doc = json.loads(line)
+                    break
+                except Exception:
+                    continue
+        if not isinstance(doc, dict) or not doc.get("ok"):
+            err = ""
+            if isinstance(doc, dict):
+                err = str(doc.get("skip") or doc.get("error") or "")
+            err = err or ("no-json: " + (out or "")[-160:])
+            log_warn("[READ] 聊天区读取失败（%s，耗时 %dms）-> 回退列表预览" % (err[:200], elapsed_ms))
+            return {"ok": False, "texts": [], "error": err[:200]}
+        bubbles = [b for b in (doc.get("bubbles") or []) if isinstance(b, dict)]
+        texts = [str(b.get("text") or "").strip() for b in bubbles]
+        texts = [t for t in texts if t]
+        crop = str(doc.get("crop") or "").strip()
+        crop_size = doc.get("cropSize") or [0, 0]
+        if crop and not os.path.isfile(crop):
+            crop = ""
+        if crop:
+            log_info("[READ] 聊天区裁剪图: %s size=%sx%s（供多模态模型看图）"
+                     % (crop, crop_size[0] if len(crop_size) > 0 else 0,
+                        crop_size[1] if len(crop_size) > 1 else 0))
+            # 只保留最近 60 张，避免截图目录无限增长
+            try:
+                shots = sorted(
+                    (os.path.join(os.path.dirname(crop), f)
+                     for f in os.listdir(os.path.dirname(crop))
+                     if str(f).startswith("chatcrop-") and str(f).endswith(".png")),
+                    key=lambda x: os.path.getmtime(x))
+                for old in shots[:-60]:
+                    try:
+                        os.remove(old)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        log_info("[READ] 聊天区读到 %d 条对方消息（耗时 %dms）: %r" % (
+            len(texts), elapsed_ms, texts[:5]))
+        return {"ok": True, "texts": texts, "bubbles": bubbles, "elapsedMs": elapsed_ms,
+                "crop": crop, "cropSize": crop_size}
 
     def _call_reply_py(self, chat, text):
         """调用现成的 reply.py 真发送（只调用，不改它的发送逻辑）。"""
         gen_cfg = self.config.get("gen") or {}
         timeout = float(gen_cfg.get("sendTimeoutSeconds") or 120)
-        python = sys.executable or "python"
+        python = sys.executable or "E:\\anaconda\\python.exe"
         cmd = [python, REPLY_PY_PATH, "--chat", chat, "--text", text]
         since = time.time()
         log_info("%s 调用 reply.py: chat=%r text=%r timeout=%.0fs" % (
@@ -2616,6 +3559,12 @@ class Watchdog:
             "targetSessionId": target_sid,
             "promptChars": len(str(plan.get("prompt") or "")),
         }
+        if plan.get("triggerHit"):
+            log_info("[REMOTE] 触发词命中（来源=%s，原文片段=%r）"
+                     % (plan.get("triggerSource") or "-",
+                        str(plan.get("triggerSnippet") or "")[:80]))
+        if action == "need_password" and plan.get("triggerHit") and not plan.get("passwordOk"):
+            log_info("[REMOTE] 触发词命中但消息内无有效密码 -> need_password（不计数）")
         if action == "chat_only":
             if plan.get("audit"):
                 append_remote_audit(remote_cfg, dict(base_audit, action="chat_only"))
@@ -2665,6 +3614,7 @@ class Watchdog:
             append_remote_audit(remote_cfg, dict(base_audit, action="wake_ok",
                                                  targetSessionId=target_sid,
                                                  latencyMs=latency_ms))
+            self.memo_log("remote", "remote command done: %s" % str(cmd_text)[:60])
             log_info("[REMOTE] wake_ok level=%s（session/prompt ok，%dms）-> 结果由 Agent 用 "
                      "reply.py/sendfile.py 发回；本进程不再自己发文本（避免 sendguard 30s "
                      "限流拦掉结果）" % (level, latency_ms))
@@ -2854,14 +3804,111 @@ class Watchdog:
         if not gen_cfg.get("enabled", True):
             log_info("skip: gen.enabled=false -> 不生成、不发送")
             return {"ok": False, "skipped": "gen-disabled", "retry": False}
+        # 2026-10-27 会话类型（memo/group/private）：config.chatTypes 优先，否则按标题 (数字) 推断
+        try:
+            chat_meta = genreply_resolve_chat_type(chat, cfg.get("chatTypes") or {}, display)
+        except Exception as exc:
+            log_warn("[GEN] 会话类型解析失败（按私聊处理）: %s" % exc)
+            chat_meta = {"type": "private", "name": chat, "members": 0,
+                         "line": "【会话类型】私聊（%s）。" % chat, "hint": "", "label": "私聊"}
+        log_info("[GEN] 会话类型=%s（%s%s）" % (
+            chat_meta.get("type"), chat_meta.get("name"),
+            ("，共 %d 人" % chat_meta["members"]) if chat_meta.get("members") else ""))
 
-        # 1) 对方说了什么（可选 OCR；测试注入可覆盖）
+        # 1.0) 灰区保险（2026-10-27 用户同意）：白名单综合分落在 0.55~0.65 灰区时，
+        #      先打开该会话读标题复核（复用 reply.py --read-msg，内部含标题校验）；
+        #      标题能对上才继续生成/发送，对不上就放弃并记日志。
+        row_score = 0.0
+        try:
+            row_score = float(row.get("score") or 0.0)
+        except Exception:
+            row_score = 0.0
+        wlm_cfg = cfg.get("whitelistMatch") or {}
+        try:
+            grey_lo = float(wlm_cfg.get("greyZoneLow") or 0.55)
+            grey_hi = float(wlm_cfg.get("greyZoneHigh") or 0.65)
+        except Exception:
+            grey_lo, grey_hi = 0.55, 0.65
+        grey_read = None
+        if grey_lo <= row_score < grey_hi:
+            log_info("[GUARD] whitelist 灰区 score=%.2f（%.2f~%.2f）-> 先打开会话读标题复核 chat=%r"
+                     % (row_score, grey_lo, grey_hi, chat))
+            grey_read = self._read_chat_incoming(chat, gen_cfg, force=True)
+            if not grey_read.get("ok"):
+                log_error("[GUARD] whitelist 灰区 -> 标题复核不通过，放弃（chat=%r，原因=%s）"
+                          % (chat, str(grey_read.get("error") or "")[:160]))
+                return {"ok": False, "skipped": "grey-title-verify-failed", "retry": False,
+                        "chat": chat, "display": display, "score": row_score}
+            log_info("[GUARD] whitelist 灰区 -> 标题复核通过（chat=%r score=%.2f）"
+                     % (chat, row_score))
+
+        # 1) 对方说了什么（2026-10-27 大修，用户实测：列表小字预览 OCR 成乱码导致回复跑偏）：
+        #    ① 优先「打开会话后聊天区最后几条气泡」（字号大、背景干净，读得准，能拿到连发多条）；
+        #    ② 聊天区读不到才退回「会话列表预览 OCR」（小字，已升级 2~3x 放大 + 多 PSM 并集/共识）；
+        #    ③ 仍不可靠（低置信度）-> 不把乱码喂给模型，改用占位说明 + 保守万能回复。
+        #    测试注入的 incoming 直接信任（用于端到端自测）。
         test_in = str((info or {}).get("test_incoming") or "").strip()
+        incoming = ""
+        incoming_ocr_raw = ""
+        incoming_src = ""
+        incoming_variants = []
+        incoming_low = False
+        incoming_low_reason = ""
+        chat_msgs = []
+        read_res = {}
         if test_in:
             incoming, incoming_src = test_in, "test-injected"
             log_info("%s 对方消息（测试注入）: %r" % (genreply.GEN_TAG, incoming))
         else:
-            incoming, incoming_src = self._recent_message_text(info, row)
+            preview_txt, preview_src, preview_variants = self._recent_message_text(info, row)
+            read_res = grey_read if grey_read is not None else self._read_chat_incoming(chat, gen_cfg)
+            if read_res.get("ok") and read_res.get("texts"):
+                good = []
+                for t in read_res.get("texts") or []:
+                    q_ok, q_why = ocr_text_quality(t)
+                    if q_ok:
+                        good.append(t)
+                    else:
+                        log_warn("%s 聊天区气泡低质量（%s）-> 丢弃该条: %r" % (
+                            genreply.GEN_TAG, q_why, str(t)[:120]))
+                if good:
+                    max_b = max(1, min(5, int(gen_cfg.get("chatReadMaxBubbles") or 3)))
+                    chat_msgs = good[-max_b:]
+                    incoming = merge_incoming_texts(chat_msgs)
+                    incoming_src = "chat-area"
+                    incoming_variants = list(chat_msgs)
+                    log_info("%s 最终 incoming 来源=聊天区（%d 条）: %r" % (
+                        genreply.GEN_TAG, len(chat_msgs), incoming[:300]))
+            if not incoming:
+                incoming, incoming_src = preview_txt, (preview_src or "ocr-preview")
+                incoming_variants = list(preview_variants or [])
+                log_info("%s 最终 incoming 来源=会话列表预览: %r" % (
+                    genreply.GEN_TAG, str(incoming)[:160]))
+            # 低置信度兜底：别让模型对着乱码自由发挥
+            # 注意：合并后的多条消息（chat_msgs>1）不是同一句话的多遍 OCR，不能用「候选一致性」判据；
+            # 只有单条消息/列表预览的多遍候选才做候选间一致性检查。
+            q_variants = None
+            if len(chat_msgs) <= 1 and len(incoming_variants) >= 2:
+                q_variants = incoming_variants
+            q_ok, q_why = ocr_text_quality(
+                incoming, variants=q_variants,
+                strict_raw=bool(incoming_src and str(incoming_src).startswith(("ocr-preview", "empty"))))
+            if not incoming:
+                q_ok, q_why = False, "empty"
+            incoming_ocr_raw = incoming
+            if not q_ok:
+                incoming_low = True
+                incoming_low_reason = q_why
+                log_warn("%s incoming 低置信度（原文=%r，原因=%s）-> 走保守回复"
+                         % (genreply.GEN_TAG, str(incoming)[:160], q_why))
+                # 2026-10-27 多模态：有图时 OCR 只是参考，低置信度不应把回复退化成「嗯嗯，在的」
+                if gen_cfg.get("visionEnabled", True) and str((read_res or {}).get("crop") or ""):
+                    log_warn("%s vision 模式：OCR 低置信度只作参考，仍送聊天区截图给模型看图生成"
+                             "（不退回保守万能回复）" % genreply.GEN_TAG)
+                incoming = ("（对方发来一条消息，OCR 未能可靠识别内容。不要猜测对方说了什么，"
+                            "只回一句最保守的万能接话，例如「嗯嗯，在的」或「咋啦」；"
+                            "绝对不要说「没看懂」「你再说一遍」这类把问题甩回给对方的话）")
+                incoming_src = "low-confidence-placeholder"
 
         # 1.5) 远程指令闸门（2026-10-26）：来信含口令 -> 转告 Agent（session/prompt），
         #      **绝不走 genreply、绝不自己发文本**；不含口令才继续下面的普通闲聊回复。
@@ -2873,13 +3920,50 @@ class Watchdog:
             return remote_res
 
         # 2) 进程内 HTTPS 调官方 API 生成回复
-        gen_res = genreply.generate(gen_cfg, BASE_DIR, chat, incoming,
-                                    log_info=log_info, log_warn=log_warn, log_error=log_error)
+        #    2026-10-27 多模态升级：优先把聊天区截图直接发给模型「看图」（OCR 只作参考）；
+        #    图片不存在/读取失败/模型不支持 -> 自动回退纯文本模式。
+        gen_res = None
+        vision_res = None
+        ocr_ref = incoming_ocr_raw or incoming
+        vision_enabled = bool(gen_cfg.get("visionEnabled", True))
+        vision_crop = str((read_res or {}).get("crop") or "")
+        if vision_enabled and vision_crop and os.path.isfile(vision_crop):
+            vision_res = genreply.generate_with_image(
+                gen_cfg, BASE_DIR, vision_crop, chat, ocr_ref,
+                log_info=log_info, log_warn=log_warn, log_error=log_error,
+                chat_meta=chat_meta)
+            if vision_res.get("ok"):
+                gen_res = vision_res
+                log_info("%s vision 生成成功（看图模式）chat=%r image=%r"
+                         % (genreply.GEN_TAG, chat, vision_crop))
+                if vision_res.get("taskHint"):
+                    log_info("[GEN] vision 判定：疑似任务指令（仅记录，不驱动执行；"
+                             "执行仍由触发词+密码决定）chat=%r" % chat)
+            else:
+                log_warn("%s vision 失败 -> 回退文本模式（原因=%s）"
+                         % (genreply.GEN_TAG, str(vision_res.get("error") or "")[:220]))
+        else:
+            log_info("%s vision 不可用（%s）-> 文本模式"
+                     % (genreply.GEN_TAG,
+                        "visionEnabled=false" if not vision_enabled
+                        else "无裁剪图/文件不存在: %r" % vision_crop))
+        if gen_res is None:
+            gen_res = genreply.generate(gen_cfg, BASE_DIR, chat, incoming,
+                                        log_info=log_info, log_warn=log_warn, log_error=log_error,
+                                        chat_meta=chat_meta)
         payload["gen"] = {
             "ok": bool(gen_res.get("ok")),
             "text": gen_res.get("text") or "",
             "incoming": incoming,
             "incomingSource": incoming_src,
+            "incomingOcrRef": str(ocr_ref or "")[:500],
+            "vision": bool(gen_res.get("vision")),
+            "visionImage": gen_res.get("image") or vision_crop,
+            "visionError": str((vision_res or {}).get("error") or "")[:300],
+            "incomingQuality": {"lowConfidence": bool(incoming_low),
+                                "reason": incoming_low_reason,
+                                "chatBubbles": len(chat_msgs),
+                                "variants": list(incoming_variants or [])[:6]},
             "model": gen_res.get("model") or (gen_cfg.get("model") or ""),
             "latencyMs": gen_res.get("latencyMs"),
             "attempts": gen_res.get("attempts"),
@@ -2903,21 +3987,85 @@ class Watchdog:
             return {"ok": False, "skipped": "dry-run", "retry": False, "text": text}
 
         # 4) 发送护栏（5 条）
+        # 🔴 2026-10-27 用户实测修复：duplicate-text 不再「丢弃消息」。
+        #    消息是新的，只是生成的答案撞了最近 60s 内已发过的句子 -> 把「最近已发文本」
+        #    作为禁止重复清单塞进 prompt，换一种说法重生成（最多 duplicateRegenAttempts 次）；
+        #    成功 -> 正常发送；仍撞车 -> 不发送，但记 reply-failures + 走提醒通道，绝不静默丢弃。
         self.guard_state = sendguard.load_state(GUARD_STATE_PATH)
         verdict = sendguard.check(cfg, self.guard_state, chat, text,
                                   whitelisted=True)
+        try:
+            max_regen = max(1, int(guard_cfg.get("duplicateRegenAttempts") or 2))
+        except Exception:
+            max_regen = 2
+        dup_regen_attempts = 0
+        dup_regen_log = []
+        while ((not verdict.get("ok"))
+               and str(verdict.get("skip") or "") == "duplicate-text"
+               and dup_regen_attempts < max_regen):
+            dup_regen_attempts += 1
+            avoid = sendguard.recent_texts(self.guard_state, chat, limit=3)
+            log_warn("%s duplicate-text 命中 -> 换说法重生成（第 %d 次） chat=%r 撞车文本=%r "
+                     "禁止重复清单=%d 条=%r"
+                     % (sendguard.GUARD_TAG, dup_regen_attempts, chat, text,
+                        len(avoid), [str(x)[:40] for x in avoid]))
+            gen_res2 = genreply.generate(gen_cfg, BASE_DIR, chat, incoming,
+                                         log_info=log_info, log_warn=log_warn, log_error=log_error,
+                                         avoid_texts=avoid, chat_meta=chat_meta)
+            if not gen_res2.get("ok"):
+                log_error("%s [GEN] 换说法重生成失败（%s）-> 保留队列/提醒处理"
+                          % (sendguard.GUARD_TAG, gen_res2.get("error")))
+                break
+            text2 = str(gen_res2.get("text") or "")
+            if not text2:
+                break
+            dup_regen_log.append({"avoid": avoid[:3], "old": text, "new": text2})
+            text = text2
+            gen0 = dict(payload.get("gen") or {})
+            gen0.update({"ok": True, "text": text,
+                         "model": gen_res2.get("model"),
+                         "latencyMs": gen_res2.get("latencyMs"),
+                         "attempts": gen_res2.get("attempts"),
+                         "avoidRepeated": list(avoid[:3])})
+            payload["gen"] = gen0
+            verdict = sendguard.check(cfg, self.guard_state, chat, text,
+                                      whitelisted=True)
+            if verdict.get("ok"):
+                log_info("%s 重生成后不再重复 -> 发送 chat=%r text=%r（第 %d 次换说法）"
+                         % (sendguard.GUARD_TAG, chat, text, dup_regen_attempts))
         payload["guard"] = verdict
+        if dup_regen_log:
+            payload["dedupeRegen"] = {"attempts": dup_regen_attempts,
+                                      "detail": dup_regen_log}
         sendguard.save_state(GUARD_STATE_PATH, self.guard_state)
         if not verdict.get("ok"):
             log_warn("%s skip: %s（%s）-> 不发送 chat=%r text=%r" % (
                 sendguard.GUARD_TAG, verdict.get("skip"), verdict.get("detail"),
                 chat, text))
+            if str(verdict.get("skip") or "") == "duplicate-text":
+                # 换说法 max_regen 次仍撞车：不发送，但必须记失败 + 走提醒通道（绝不静默丢弃）
+                log_error("%s duplicate-text 命中且换说法 %d 次仍重复 -> 本次不发送"
+                          "（不写 processed_fingerprint）chat=%r text=%r"
+                          % (sendguard.GUARD_TAG, dup_regen_attempts, chat, text))
+                try:
+                    nres = self._notify_reply_failure(
+                        chat, "duplicate-text",
+                        "小耳朵提醒，想给 %s 的回复连续撞车没发出去，原因 duplicate-text" % chat,
+                        display=display)
+                    log_info("[ALERT] duplicate-text 失败提醒已记录 ok=%s" % bool(nres.get("ok")))
+                except Exception as exc:
+                    log_error("[ALERT] duplicate-text 失败提醒异常: %s" % exc)
+                return {"ok": False, "skipped": "duplicate-text-final", "retry": False,
+                        "text": text, "guard": verdict,
+                        "chat": chat, "display": display}
             if verdict.get("stop"):
-                log_warn("%s stop: 连续 %s 条达上限 -> 停了等用户发话（pausedUntil=%s）"
+                log_warn("%s stop: 本会话已连发 %s 条达上限 -> 暂停（消息不丢弃，入队等待；"
+                         "暂停期结束后合并补发，超过 TTL 则丢弃并记日志）pausedUntil=%s"
                          % (sendguard.GUARD_TAG, guard_cfg.get("perChatMaxBurst"),
                             verdict.get("detail")))
             return {"ok": False, "skipped": verdict.get("skip"), "retry": False,
-                    "text": text, "guard": verdict}
+                    "text": text, "guard": verdict,
+                    "chat": chat, "display": display}
 
         # 5) 调 reply.py 真发送
         send = self._call_reply_py(chat, text)
@@ -3367,6 +4515,41 @@ class Watchdog:
             len(filt.get("black_rows") or rows or [])))
 
     # ---- 新未读事件：OCR -> 黑名单 -> 白名单 -> 唤醒 or 只记录 ----
+    # ---- 白名单 miss 短冷却（2026-10-27：miss 不写 processed_fingerprint，避免 OCR 误判永久漏回） ----
+    def _whitelist_miss_cooldown_seconds(self):
+        cfg = self.config.get("whitelistMatch") or {}
+        try:
+            return max(5.0, float(cfg.get("missCooldownSeconds") or 45))
+        except Exception:
+            return 45.0
+
+    @staticmethod
+    def _whitelist_miss_key(digest):
+        try:
+            return hashlib.sha1(("wlmiss:" + str(digest or "")).encode()).hexdigest()[:16]
+        except Exception:
+            return str(digest or "")[:16]
+
+    def whitelist_miss_cooldown_left(self, digest, now=None):
+        now = float(now if now is not None else time.time())
+        m = self.state.get("whitelist_miss_cooldown") or {}
+        left = float(m.get(self._whitelist_miss_key(digest)) or 0) - now
+        return max(0.0, left)
+
+    def mark_whitelist_miss(self, digest):
+        """记一个短冷却（不写 processed_fingerprint）。返回冷却秒数。"""
+        cd = self._whitelist_miss_cooldown_seconds()
+        now = time.time()
+        m = dict(self.state.get("whitelist_miss_cooldown") or {})
+        m = {k: v for k, v in m.items() if float(v or 0) > now - 300}
+        m[self._whitelist_miss_key(digest)] = now + cd
+        self.state["whitelist_miss_cooldown"] = m
+        try:
+            save_state(self.state)
+        except Exception:
+            pass
+        return cd
+
     def _handle_new_unread(self, info, reason, is_retry=False):
         filt = self._filtered_fp(info)
         digest = filt["digest"]
@@ -3377,6 +4560,20 @@ class Watchdog:
             self.last_fp_info = {"digest": digest, "count": fp_count, "rows": filt["rows"]}
             self._clear_retry("该指纹已确认发送过")
             log_info("skip: fingerprint-already-processed fp=%s（state.json 中已确认处理过，不重复回复）" % digest)
+            return
+
+        # 2026-10-27：白名单 miss 不写 processed_fingerprint，只做短冷却；冷却期内同一未读直接跳过
+        _wl_left = self.whitelist_miss_cooldown_left(digest, now)
+        if _wl_left > 0:
+            log_info("skip: whitelist-miss-cooldown（同一未读 %.0fs 前刚判过白名单未命中，先跳过；"
+                     "不写 processed_fingerprint，%.0fs 后可重判）fp=%s"
+                     % (self._whitelist_miss_cooldown_seconds() - _wl_left, _wl_left, digest))
+            self.last_fp = digest
+            self.last_fp_info = {"digest": digest, "count": fp_count, "rows": filt["rows"]}
+            self.pending_fp = None
+            self.pending_count = 0
+            self.prev_unread = True
+            self.prev_badges = fp_count
             return
 
         # OCR 识别所有未读行 + 黑/白名单判定（缓存到 state.row_name_cache）
@@ -3470,6 +4667,42 @@ class Watchdog:
             return
         if reply_res.get("skipped"):
             skipped = str(reply_res.get("skipped"))
+            # 🔴 2026-10-27 用户实测修复（bug 1）：per-chat-interval 被限流跳过时【不再丢弃】。
+            #   旧逻辑走下面「写 processed_fingerprint 防止反复生成」-> 那条消息永久漏回。
+            #   现在：入队 pending_replies.json，冷却结束后合并成一条回复补发；
+            #   **绝不写 processed_fingerprint**（没发出去就不能算已处理）。
+            # 🔴 2026-10-27 去重修复：换说法 2 次仍撞车 -> 本次不发送，但【不写 processed_fingerprint】
+            #    （消息没回，不能当已处理吞掉；已由 generate_and_send 写 reply-failures + 提醒通道）
+            if skipped == "duplicate-text-final":
+                log_error("[GUARD] duplicate-text 换说法后仍重复 -> 本次不发送，已写 reply-failures 提醒；"
+                          "【不写 processed_fingerprint】fp=%s" % digest2)
+                return
+            # 2026-10-27 用户实测修复：whitelist-miss 不写 processed_fingerprint（OCR 噪声可能误判，
+            #   写了指纹就永久漏回）；改成 30~60s 短冷却，冷却后还能重新判。
+            if skipped == "whitelist-miss":
+                _cd = self.mark_whitelist_miss(digest2)
+                log_warn("[WHITELIST] whitelist-miss -> 【不写 processed_fingerprint】"
+                         "（可能只是 OCR 噪声误判；%.0fs 内跳过同一未读，之后可重判）fp=%s"
+                         % (_cd, digest2))
+                return
+            # 2026-10-27 灰区保险：标题复核不通过 -> 放弃本次（不写 processed_fingerprint）
+            if skipped == "grey-title-verify-failed":
+                log_error("[GUARD] whitelist 灰区 -> 标题复核不通过，放弃"
+                          "（【不写 processed_fingerprint】，避免把消息永久吞掉）；fp=%s" % digest2)
+                self.mark_whitelist_miss(digest2)
+                return
+            if skipped in ("per-chat-interval", "per-chat-burst"):
+                q_chat = str(reply_res.get("chat") or "").strip()
+                q_display = str(reply_res.get("display") or "")
+                q_incoming = str(((payload or {}).get("gen") or {}).get("incoming") or "").strip()
+                q_guard = reply_res.get("guard") or {}
+                if q_chat and self._queue_rate_limited_reply(q_chat, q_display, q_incoming,
+                                                             digest2, q_guard):
+                    return
+                log_warn("[QUEUE] %s 入队失败（chat=%r）-> 不写 processed_fingerprint，"
+                         "保留待处理状态重试" % (skipped, q_chat))
+                self._schedule_retry(filt2, rows, skipped, info)
+                return
             if reply_res.get("retry"):
                 # 静默时段/限速：延后重试（不计入已处理）
                 log_warn("skip: %s -> 【不写 processed_fingerprint】，保留待处理状态重试" % skipped)
@@ -3609,11 +4842,14 @@ class Watchdog:
                         info["img"], info["geom"], row_idx, tesseract, ocr_cfg)
                 except Exception as exc:
                     log_warn("OCR 第 %d 行失败: %s" % (row_idx, exc))
-            m_white = name_match(candidates, whitelist, match_cfg)
+            # 2026-10-27：白名单改用「闭集判别」（多候选 × 多白名单项打分取最高，阈值+margin）
+            m_white = whitelist_match(candidates, whitelist, match_cfg)
             m_black = name_match(candidates, blacklist, match_cfg) if blacklist else None
             display = m_white.get("display") or (m_black or {}).get("display") or "(OCR无结果)"
             is_white = bool(m_white.get("hit"))
             is_black = bool(m_black and m_black.get("hit"))
+            _wl_line = format_whitelist_ranking(m_white)
+            _parts = m_white.get("parts") or {}
             if is_black and is_white:
                 log_info("blacklist hit ignored: display='%s' 同时命中白名单 -> 按白名单处理" % display)
                 is_black = False
@@ -3623,13 +4859,25 @@ class Watchdog:
                     display, m_black.get("matched"), m_black.get("reason"), row_idx))
             elif is_white:
                 any_white = True
-                log_info("whitelist hit: display='%s' matched='%s' reason=%s (row=%d, ocr候选=%s)" % (
-                    display, m_white.get("matched"), m_white.get("reason"), row_idx,
-                    " | ".join(candidates[:3])))
+                log_info("whitelist match: '%s' -> '%s' score=%.2f(ratio=%.2f jac=%.2f len=%.2f) "
+                         "次优='%s' score=%.2f margin=%.2f (row=%d, ocr候选=%s)"
+                         % (display, m_white.get("matched"),
+                            float(m_white.get("score") or 0),
+                            float(_parts.get("ratio") or 0), float(_parts.get("jaccard") or 0),
+                            float(_parts.get("length") or 0),
+                            str((m_white.get("ranking") or [{}, {}])[1].get("item") or "-"),
+                            float(m_white.get("secondScore") or 0),
+                            float(m_white.get("margin") or 0), row_idx,
+                            " | ".join(candidates[:3])))
             else:
-                log_info("whitelist miss: display='%s' normalized='%s' (row=%d, ocr候选=%s)" % (
-                    display, m_white.get("normalized") or "", row_idx,
-                    " | ".join(candidates[:3]) or "无"))
+                log_info("whitelist miss: display='%s' normalized='%s' (row=%d, ocr候选=%s)；"
+                         "各条目: %s"
+                         % (display, m_white.get("normalized") or "", row_idx,
+                            " | ".join(candidates[:3]) or "无", _wl_line))
+            # 白名单每一项的三分/综合分都打出来（命中/未命中都打，方便排查「时灵时不灵」）
+            if candidates:
+                log_info("whitelist scores(row=%d, display='%s'): %s"
+                         % (row_idx, m_white.get("display") or display, _wl_line))
             self._cache_row_name(r, display, is_black, is_white)
             rows.append({
                 "row": row_idx,
@@ -3639,6 +4887,8 @@ class Watchdog:
                 "reason": m_white.get("reason") or (m_black or {}).get("reason") or "",
                 "display": display,
                 "normalized": m_white.get("normalized") or "",
+                "score": float(m_white.get("score") or 0.0),
+                "margin": float(m_white.get("margin") or 0.0),
                 "candidates": candidates[:6],
             })
         try:
@@ -3731,16 +4981,28 @@ class Watchdog:
                 str(gen_cfg.get("personaFile") or "persona.txt")))
         except Exception as exc:
             log_error("[GEN] 凭据读取失败（生成会失败，不会发送）: %s" % genreply.mask_key(exc))
-        log_info("[GEN] 生成参数: maxTokens<=%s temperature=%s timeout=%ss maxReplyChars=%s ocrPreview=%s" % (
-            gen_cfg.get("maxTokens"), gen_cfg.get("temperature"),
-            gen_cfg.get("timeoutSeconds"), gen_cfg.get("maxReplyChars"),
-            gen_cfg.get("ocrPreview")))
+        log_info("[GEN] 生成参数: maxTokens<=%s temperature=%s timeout=%ss maxReplyChars=%s ocrPreview=%s "
+                 "readChatArea=%s chatReadMaxBubbles=%s（incoming 优先取聊天区气泡，列表预览作兜底）" % (
+                     gen_cfg.get("maxTokens"), gen_cfg.get("temperature"),
+                     gen_cfg.get("timeoutSeconds"), gen_cfg.get("maxReplyChars"),
+                     gen_cfg.get("ocrPreview"), gen_cfg.get("readChatArea", True),
+                     gen_cfg.get("chatReadMaxBubbles", 3)))
         gcfg = self.config.get("guard") or {}
         log_info("[GUARD] 发送护栏: whitelistOnly=%s perChatMinIntervalSeconds=%s perChatMaxBurst=%s "
-                 "burstPauseSeconds=%s dedupeSameText=%s（发送记录 logs/sent-YYYYMMDD.jsonl）" % (
+                 "burstPauseSeconds=%s dedupeSameText=%s dedupeSameTextWindowSeconds=%s "
+                 "duplicateRegenAttempts=%s（发送记录 logs/sent-YYYYMMDD.jsonl）" % (
                      gcfg.get("whitelistOnly"), gcfg.get("perChatMinIntervalSeconds"),
                      gcfg.get("perChatMaxBurst"), gcfg.get("burstPauseSeconds"),
-                     gcfg.get("dedupeSameText")))
+                     gcfg.get("dedupeSameText"), gcfg.get("dedupeSameTextWindowSeconds"),
+                     gcfg.get("duplicateRegenAttempts")))
+        _pqc = self._pending_queue_cfg()
+        _pq_chats, _pq_texts = pending_queue_summary()
+        log_info("[QUEUE] 限流排队补发: enabled=%s ttlSeconds=%s maxTexts=%s retryAfterSeconds=%s "
+                 "maxAttempts=%s（同一会话冷却期内的新消息入队，冷却后合并成一条回复；"
+                 "绝不写 processed_fingerprint）当前队列: %d 会话/%d 条" % (
+                     _pqc.get("enabled"), _pqc.get("ttlSeconds"), _pqc.get("maxTexts"),
+                     _pqc.get("retryAfterSeconds"), _pqc.get("maxAttempts"),
+                     _pq_chats, _pq_texts))
         log_info("去重: settleScans=%s processed_fp=%s；白名单: %s" % (
             (self.config.get("dedupe") or {}).get("settleScans", 2),
             self.processed_fp or "(无)",
@@ -3828,6 +5090,15 @@ class Watchdog:
                             info.get("unread"), info.get("row_badges")))
                         self._warned_no_window = True
                 self.process_scan(info)
+                # 限流排队补发（2026-10-27 修复）：冷却结束 -> 合并成一条回复；
+                # 成功才清空该会话队列，不写 processed_fingerprint。
+                try:
+                    self.flush_pending_replies(info)
+                except SystemExit:
+                    raise
+                except Exception as exc:
+                    log_error("[QUEUE] 排队补发异常: %s\n%s" % (
+                        exc, traceback.format_exc(limit=3)))
                 self.hotkey_watch_sleep(max(0.5, interval))
             except KeyboardInterrupt:
                 log_info("收到 Ctrl-C，退出")
@@ -3889,6 +5160,11 @@ def print_status():
     print("  triggerCooldownSeconds: %s   retryAfterSeconds: %s   maxRetryAttempts: %s" % (
         cfg.get("triggerCooldownSeconds"), cfg.get("retryAfterSeconds"),
         cfg.get("maxRetryAttempts")))
+    _pq_chats, _pq_texts = pending_queue_summary()
+    print("  guard.perChatMinIntervalSeconds: %s   pendingQueue: %s（当前 %d 会话/%d 条）" % (
+        (cfg.get("guard") or {}).get("perChatMinIntervalSeconds"),
+        "enabled" if ((cfg.get("pendingQueue") or {}).get("enabled", True)) else "disabled",
+        _pq_chats, _pq_texts))
     print("  published_fp: %s   awaiting_send: %s   retry_pending: %s" % (
         state.get("processed_fingerprint") or "(无)",
         (state.get("awaiting_send") or {}).get("fp") or "(无)",
@@ -4190,19 +5466,24 @@ def cmd_guard_selftest():
     v = sendguard.check(cfg, st, "某个非白名单会话", "在吗", whitelisted=False, now=now)
     show("① 白名单外", v, "whitelist-miss")
 
+    g = sendguard.guard_cfg(cfg)
+    min_int = float(g.get("perChatMinIntervalSeconds") or 4)
+    max_burst = int(g.get("perChatMaxBurst") or 12)
     sendguard.record(cfg, st, "文件传输助手", "收到啦", fingerprint="fp-selftest",
-                     now=now - 10)
+                     now=now - max(1.0, min_int / 2.0))
     v = sendguard.check(cfg, st, "文件传输助手", "好呀", whitelisted=True, now=now)
-    show("② 同一会话 30s 内第二条", v, "per-chat-interval")
+    show("② 同一会话 %ss 内第二条" % ("%g" % min_int), v, "per-chat-interval")
 
     v = sendguard.check(cfg, st, "文件传输助手", "收到啦", whitelisted=True, now=now + 40)
     show("③ 同一句话重复（隔 50s）", v, "duplicate-text")
 
     st2 = {"chats": {}}
-    for i in range(5):
-        sendguard.record(cfg, st2, "连续测试群", "第%d条" % i, now=now - 100 + i * 40)
-    v = sendguard.check(cfg, st2, "连续测试群", "第六条", whitelisted=True, now=now + 100)
-    show("④ 同一会话连续 >5 条", v, "per-chat-burst-limit")
+    for i in range(max_burst):
+        sendguard.record(cfg, st2, "连续测试群", "第%d条" % i,
+                         now=now - (max_burst - i) * 40)
+    v = sendguard.check(cfg, st2, "连续测试群", "第%d条" % (max_burst + 1),
+                        whitelisted=True, now=now + 1)
+    show("④ 同一会话连续 >%d 条" % max_burst, v, "per-chat-burst")
     if v.get("stop"):
         until = time.strftime("%Y-%m-%d %H:%M:%S",
                               time.localtime(float(v.get("nextAllowedAt") or 0)))
@@ -4215,6 +5496,57 @@ def cmd_guard_selftest():
         len(results) - len(bad), len(results), "" if not bad else "，失败: %s" % bad))
     print("[GUARD] 自检用的是隔离状态文件 %s（不污染线上 guard_state.json）" % tmp_guard)
     return 0 if not bad else 1
+
+
+def cmd_vision_test(argv):
+    """多模态链路自测：打开会话读聊天区截图 -> 图片生成 -> 可选真发（--send）。
+
+    用法：python watcher.py --vision-test --chat 文件传输助手 [--send]
+    不加 --send 只生成草稿（不发送）；加 --send 会真的发一条（仅用于测试）。
+    """
+    global LOG
+    LOG = Logger()
+
+    def _arg(name, default=""):
+        if name in argv:
+            i = argv.index(name)
+            if i + 1 < len(argv):
+                return str(argv[i + 1])
+        return default
+
+    chat = _arg("--chat", "文件传输助手").strip() or "文件传输助手"
+    do_send = "--send" in argv
+    set_dpi_aware()
+    wd = Watchdog()
+    gen_cfg = wd.config.get("gen") or {}
+    log_info("[VISION-TEST] chat=%r send=%s visionEnabled=%s visionModel=%r"
+             % (chat, do_send, gen_cfg.get("visionEnabled"), gen_cfg.get("visionModel")))
+    read = wd._read_chat_incoming(chat, gen_cfg, force=True)
+    out = {"ok": False, "chat": chat,
+           "read": {k: read.get(k) for k in ("ok", "texts", "crop", "cropSize", "error")}}
+    if not read.get("ok"):
+        out["error"] = "read-failed: %s" % (read.get("error") or "")
+        print(json.dumps(out, ensure_ascii=False, default=str))
+        return 1
+    ocr_ref = merge_incoming_texts(read.get("texts") or [])
+    gen = genreply.generate_with_image(
+        gen_cfg, BASE_DIR, str(read.get("crop") or ""), chat, ocr_ref,
+        log_info=log_info, log_warn=log_warn, log_error=log_error)
+    out["ocr"] = str(ocr_ref or "")[:500]
+    out["gen"] = {k: gen.get(k) for k in ("ok", "text", "model", "usage", "latencyMs",
+                                          "image", "imageSize", "imageBytes", "error")}
+    if not gen.get("ok"):
+        out["error"] = gen.get("error")
+        print(json.dumps(out, ensure_ascii=False, default=str))
+        return 1
+    if do_send:
+        send = wd._call_reply_py(chat, str(gen.get("text") or ""))
+        out["send"] = {k: send.get(k) for k in ("ok", "rc", "confirmed", "elapsed")}
+        out["ok"] = bool(send.get("ok"))
+    else:
+        out["ok"] = True
+    print(json.dumps(out, ensure_ascii=False, default=str))
+    return 0 if out["ok"] else 1
 
 
 def main(argv):
@@ -4230,6 +5562,8 @@ def main(argv):
         return cmd_selftest()
     if "--test-gen" in argv:
         return cmd_test_gen(argv)
+    if "--vision-test" in argv:
+        return cmd_vision_test(argv)
     if "--inject-unread" in argv:
         return cmd_inject_unread(argv)
     if "--guard-selftest" in argv:

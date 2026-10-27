@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """selftest_stage1.py —— 「小耳朵」第一阶段离线自测（零屏幕操作、零微信消息、零真机注入）。
 
-用法: python selftest_stage1.py   （退出码 0 = 全过；1 = 有 FAIL）
+用法: E:\\anaconda\\python.exe selftest_stage1.py   （退出码 0 = 全过；1 = 有 FAIL）
 
 覆盖：
   T1 输入校验（input_text_metrics）：漏字/重字 -> False；正常 -> True
@@ -139,22 +139,17 @@ def t2_panel_guard():
         # 真下拉但面板下方露出会话列表（带时间戳）：搜索框里有目标名 -> 复核后仍判 dropdown
         (r"screenshots\reply-20261026-195419-dropdown.png", "文件传输助手", "dropdown", False),
         (r"screenshots\reply-20261026-231311-dropdown.png", "耳朵不存在的会话ABC", "dropdown", False),
-        # 说明：真实截图语料不随公开仓库发布；截图不存在时本组用例自动 SKIP。
-        # 目标名用占位名，跑真实语料时可自行替换。
-        (r"screenshots\reply-20261026-232052-dropdown.png", "某个较长的中文群名", "dropdown", False),
+        (r"screenshots\reply-20261026-232052-dropdown.png", "示例长名测试群甲乙丙丁戊己", "dropdown", False),
         # 假下拉（实际是会话列表、搜索框只有 placeholder）：conversation-list
         # 注：输入框有字判据 2026-10-27 第二阶段改为「目标名语义」（只认目标名被打进输入框；
         #     这两张图里是别的草稿文案，与目标名无关 -> 不再判有残留）
         (r"screenshots\reply-20261026-233501-dropdown.png", "文件传输助手", "conversation-list", False),
         (r"screenshots\reply-20261026-233515-dropdown.png", "文件传输助手", "conversation-list", False),
     ]
-    skipped_t2 = 0
     for path, target, want_kind, want_text in cases:
         p = os.path.join(BASE, path) if not os.path.isabs(path) else path
         if not os.path.exists(p):
-            # 公开仓库不带 screenshots/（真实屏幕截图含聊天隐私），没有语料就整组跳过
-            print("[SKIP] T2 %s 截图不存在（公开仓库不附带 screenshots/）" % os.path.basename(path))
-            skipped_t2 += 1
+            print("  [SKIP] T2 %s（截图不存在；公开仓库不附带 screenshots/）" % os.path.basename(path))
             continue
         try:
             img = Image.open(p).convert("RGB")
@@ -169,9 +164,6 @@ def t2_panel_guard():
         except Exception as exc:
             ck("T2 %s 分析异常" % os.path.basename(path), False, exc)
             traceback.print_exc()
-
-    if skipped_t2:
-        print("[SKIP] T2 有 %d 张真实截图语料缺失，已跳过（不影响构造用例）" % skipped_t2)
 
     # 纯逻辑构造用例（与 selftest_rows.panel_kind_cases 相同口径）
     def mk(text, y):

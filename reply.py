@@ -2,7 +2,7 @@
 """微信看门狗 · 回复发送器 v3「键盘为主 + 必要时鼠标点会话行 + 忙闲守护 + 20 秒硬超时」
 
 用法:
-  python reply.py --chat "文件传输助手" --text "回复内容"
+  E:\\anaconda\\python.exe reply.py --chat "文件传输助手" --text "回复内容"
   可选: --dry-run  只验证「定位会话 + 清空输入框 + 输入内容」，不按 Enter 发送
   可选: --match "备用会话名"（v3 忽略，仅兼容旧参数）
 
@@ -62,6 +62,8 @@ REPLY_STATE = os.path.join(BASE_DIR, "reply_state.json")
 
 # 整体动作硬超时（秒）——用户要求 20 秒
 HARD_TIMEOUT_SECONDS = 20.0
+# 2026-10-27：只读「打开会话读聊天区最后几条气泡」模式用的硬超时（打开会话本身就要 8~12s）
+READ_TIMEOUT_SECONDS = 40.0
 
 # ─────────────── 键盘 VK ───────────────
 VK_SHIFT = 0x10
@@ -973,7 +975,7 @@ def text_recall(texts, want):
 
     用途：搜索框区域的 OCR 常常把放大镜图标/滚动条/按钮一起识别进来，
     使 name_match 的 coverage（matched/len(candidate)）永远达不到阈值（实测
-    '〇文件传输助手 四 中 XXX' 这类结果）。此时用召回率判断「目标名字到底有没有输进去」更合适。
+    '〇文件传输助手 四 中 AAA' 这类结果）。此时用召回率判断「目标名字到底有没有输进去」更合适。
     返回 (best_cov, best_matched)。
     """
     w = watcher.normalize_name(want)
@@ -1238,7 +1240,7 @@ def _is_group_header(text):
     return bool(c) and any(c == h for h in GROUP_HEADERS)
 
 
-def _ocr_words(img, box, ctx, psm=6, zoom=2.0, psms=None, include_orig=True):
+def _ocr_words(img, box, ctx, psm=6, zoom=2.0, psms=None, include_orig=True, invert=True):
     """对区域做 tesseract TSV OCR，返回词级列表 [{text,x0,x1,top,bottom,y,src}]。
 
     2026-10-26：从「按 tesseract 的 block/par/line 聚合」改为「拿词级坐标自己聚类」——
@@ -1259,7 +1261,9 @@ def _ocr_words(img, box, ctx, psm=6, zoom=2.0, psms=None, include_orig=True):
     crop = img.crop((x0, y0, x1, y1))
     rgb = np.array(crop)
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    gray_inv = cv2.bitwise_not(gray)
+    # 2026-10-27：invert=False 用于「浅色背景 + 深色文字」的聊天区气泡；
+    # 搜索下拉是深色背景 + 浅色文字，需要反色（invert=True，默认）。
+    gray_inv = cv2.bitwise_not(gray) if invert else gray
     z = float(zoom or 2.0)
     # 同一个放大图的多 PSM（psm 6 段落 / psm 11 稀疏文字）；多遍结果在 _ocr_rows 里做行级并集
     arrays = [("gray-z%.1f-p%d" % (z, psm), gray_inv, z, psm)]
@@ -1375,7 +1379,7 @@ def _union_chars(variants):
 
 
 def _ocr_rows(img, box, ctx, psm=6, zoom=2.0, psms=(6, 11), include_orig=True,
-              log_compare=False):
+              log_compare=False, invert=True):
     """多遍 OCR 词级聚类 -> 行，并按行合并不同预处理/PSM 的结果（variants 保留候选文本）。
 
     2026-10-26 晚（真机 row-approximate 修复·治本）：
@@ -1385,7 +1389,7 @@ def _ocr_rows(img, box, ctx, psm=6, zoom=2.0, psms=(6, 11), include_orig=True,
       * src_texts 记录每遍 OCR 的行文本；log_compare=True 时打印「放大版 / 原始版」对照。
     """
     words = _ocr_words(img, box, ctx, psm=psm, zoom=zoom, psms=psms,
-                       include_orig=include_orig)
+                       include_orig=include_orig, invert=invert)
     s = 1.0
     by_src = {}
     for w in words:
@@ -1742,7 +1746,7 @@ def select_target_row(rows, target_clean):
     """纯选择逻辑（便于离线单测）。
 
     2026-10-26 晚（真机实测 row-approximate 修复）：tesseract 对下拉小字长中文名识别很差
-    （实测某个较长的中文群名被 OCR 读错字/插竖线，永远过不了 exact
+    （实测「示例长名测试群甲乙丙丁戊己」被读成「听|遂名长就会有猫娘认真读」，永远过不了 exact
     -> 每次 abort、会话永远打不开）。改为分档：
       1) 头像行 + exact 唯一 -> ok（保持）
       2) 头像行 + exact 多个 -> row-ambiguous abort（保持"不瞎猜"）
@@ -2547,18 +2551,31 @@ def do_open_chat(ctx, hwnd, target, match_cfg, attempt, clip):
 #    个别汉字丢失、ASCII 被改，实测「：：」「『『」「（（」「row--pproximate」），而旧的覆盖率校验
 #    match=True 放过了乱码 → 乱码消息真的发了出去。现在：
 #    * 长文本 / 含全角标点 -> 一律剪贴板 Ctrl+V（一次写入，不逐字注入）；短文本仍用 SendInput；
-#    * 输入校验改「字符数比例 + 去重字符集覆盖 + 顺序一致性」三重判据（三过才算过）；
-#    * 校验不过先重试（同一 attempt 内换方式再来一次；外层还有第 2 次 attempt），仍不过 -> abort
-#      `type-verify-failed`，**绝不按 Enter**，由 watcher 走降级通道告警。
+#    * 输入校验「去标点后的字符数比例 + 去重字符集覆盖 + 顺序一致性」，长度自适应阈值；
+#    * 2026-10-27 用户实测修复（短文本+中文标点误判）：
+#        - 比较前先剥掉所有标点（，。！？、；：""''（）《》…——· 及半角），只比汉字/字母/数字，
+#          避免 OCR 漏读一个「，」就把 cover 从 1.0 打到 0.75 而误判失败；
+#        - 阈值按去标点后的字数分三档：≤6字(L1) cover≥0.60 seq≥0.50；7~15字(L2) cover≥0.80 seq≥0.70；
+#          >15字(L3) 维持严格 cover≥0.85 seq≥0.80；日志打 thr=L1/L2/L3；
+#        - 像素差兜底：OCR 判不过但输入框像素差 >= inputPixelDiffMin -> 判定内容已输入，
+#          evidence=pixdiff 继续走发送前校验（标题校验/前台复检/硬超时仍在 Enter 前把关）；
+#        - 重试只保留 1 次（原来内层重试 + 外层第 2 次最多写 4 遍，用户看着像"写了又擦"）。
 LONG_TEXT_CLIPBOARD_THRESHOLD = 12
 # 全角标点/引号/括号：SendInput 逐字注入时最容易出成对重复/丢字，一律走剪贴板
 FULLWIDTH_SENSITIVE = set("：；，。！？、『』「」（）【】《》〈〉“”‘’…—·～　"
                           "：；，。！？、（）【】《》“”‘’")
-INPUT_MIN_CHAR_RATIO = 0.85     # OCR 有效字符数 / 期望有效字符数 下限
-INPUT_MAX_CHAR_RATIO = 1.25     # 上限（重字/重复标点会超出）
-INPUT_MIN_COVER = 0.85          # 期望去重字符集在 OCR 结果中的覆盖率下限（0.90->0.85，容忍长名字 OCR 噪声）
-INPUT_MIN_SEQ = 0.80            # SequenceMatcher ratio 下限（0.75->0.80；成对重复会先掉这里）
-INPUT_MAX_UNIQUE_RATIO = 1.15   # OCR 去重字符数 / 期望去重字符数 上限（重字/重复标点会显著变多）
+# 长度自适应阈值（2026-10-27）：max_chars=该档最大去标点字数（None=无上限）
+INPUT_THRESHOLDS = {
+    "L1": {"max_chars": 6, "char_ratio": (0.60, 1.40), "cover": 0.60, "seq": 0.50},
+    "L2": {"max_chars": 15, "char_ratio": (0.80, 1.30), "cover": 0.80, "seq": 0.70},
+    "L3": {"max_chars": None, "char_ratio": (0.85, 1.25), "cover": 0.85, "seq": 0.80},
+}
+# 兼容旧常量（L3 严格档；被其它地方引用时保持原语义）
+INPUT_MIN_CHAR_RATIO = 0.85
+INPUT_MAX_CHAR_RATIO = 1.25
+INPUT_MIN_COVER = 0.85
+INPUT_MIN_SEQ = 0.80
+INPUT_MAX_UNIQUE_RATIO = 1.15
 
 
 _PUNCT_CANON = {
@@ -2591,6 +2608,25 @@ def _norm_for_verify(s):
     return "".join(out)
 
 
+def _strip_verify_punct(s):
+    """去掉所有标点/符号，只留汉字/字母/数字（2026-10-27：OCR 漏读标点不算内容错）。"""
+    return "".join(ch for ch in str(s or "")
+                   if ch.isalnum() or ("\u4e00" <= ch <= "\u9fff"))
+
+
+def _verify_level(n_core_chars):
+    """按去标点后的字数选阈值档位：L1 ≤6 字 / L2 7~15 字 / L3 >15 字。"""
+    try:
+        n = int(n_core_chars)
+    except Exception:
+        n = 0
+    if n <= 6:
+        return "L1"
+    if n <= 15:
+        return "L2"
+    return "L3"
+
+
 def _dup_punct_pairs(expected_norm, got_norm):
     """找 OCR 结果里「相邻重复标点」且期望文本里没有同样的重复 -> SendInput 丢字/重字的典型特征。
 
@@ -2616,25 +2652,33 @@ def _needs_clipboard_input(text):
 
 
 def input_text_metrics(expected, ocr_text):
-    """计算输入校验判据：字符数比例 / 去重字符集覆盖 / 顺序一致性 / 去重字符数（+ 重复标点）。
+    """计算输入校验判据：去标点后的 字符数比例 / 去重字符集覆盖 / 顺序一致性 / 去重字符数 + 重复标点。
 
-    返回 dict：chars、expected、ratio、chars_ok、cover、seq、uniq、uniq_ratio、uniq_ok、dup、ok。
-    ok = 三条判据全过 + 去重字符数不超标 + 没有「期望文本里不存在的相邻重复标点」。
+    2026-10-27 用户实测修复：
+      * 先把 expected/OCR 都剥掉标点（见 _strip_verify_punct）再比，OCR 漏读「，」不再误判；
+      * 阈值按去标点后字数分三档（INPUT_THRESHOLDS），返回 level/thr_cover/thr_seq 供日志打印；
+      * 成对重复标点检查仍用「保留标点」的归一化串（否则查不出 ：：/，，这类 SendInput 乱码）。
+    返回 dict：chars、expected、ratio、chars_ok、cover、seq、uniq、uniq_ratio、uniq_ok、
+              dup、level、thr_cover、thr_seq、ok。
     """
     exp = _norm_for_verify(expected)
     got = _norm_for_verify(ocr_text)
-    n_exp, n_got = len(exp), len(got)
+    exp_core = _strip_verify_punct(exp)
+    got_core = _strip_verify_punct(got)
+    n_exp, n_got = len(exp_core), len(got_core)
+    level = _verify_level(n_exp)
+    th = INPUT_THRESHOLDS[level]
     ratio = (n_got / float(n_exp)) if n_exp else 0.0
-    chars_ok = (INPUT_MIN_CHAR_RATIO <= ratio <= INPUT_MAX_CHAR_RATIO) if n_exp else False
-    exp_set = set(exp)
-    got_set = set(got)
+    lo, hi = th["char_ratio"]
+    chars_ok = (lo <= ratio <= hi) if n_exp else False
+    exp_set = set(exp_core)
+    got_set = set(got_core)
     cover = (len(exp_set & got_set) / float(len(exp_set))) if exp_set else 0.0
-    # 2026-10-26 23:3x 新增：去重字符数判据（成对重复/重字会让 OCR 去重字符数明显多于期望）
     n_uniq_exp, n_uniq_got = len(exp_set), len(got_set)
     uniq_ratio = (n_uniq_got / float(n_uniq_exp)) if n_uniq_exp else 0.0
     uniq_ok = (n_uniq_got <= max(n_uniq_exp + 2, int(n_uniq_exp * INPUT_MAX_UNIQUE_RATIO)))
     try:
-        seq = difflib.SequenceMatcher(None, exp, got, autojunk=False).ratio()
+        seq = difflib.SequenceMatcher(None, exp_core, got_core, autojunk=False).ratio()
     except Exception:
         seq = 0.0
     dup = _dup_punct_pairs(exp, got)
@@ -2642,27 +2686,39 @@ def input_text_metrics(expected, ocr_text):
             "cover": cover, "seq": seq,
             "uniq": n_uniq_got, "uniq_expected": n_uniq_exp, "uniq_ratio": uniq_ratio,
             "uniq_ok": uniq_ok, "dup": dup,
-            "ok": bool(chars_ok and cover >= INPUT_MIN_COVER
-                       and seq >= INPUT_MIN_SEQ and uniq_ok and not dup)}
+            "level": level, "thr_cover": th["cover"], "thr_seq": th["seq"],
+            "core": got_core, "core_expected": exp_core,
+            "ok": bool(chars_ok and cover >= th["cover"]
+                       and seq >= th["seq"] and uniq_ok and not dup)}
 
 
 def _fmt_input_metrics(m):
+    if not isinstance(m, dict):
+        return "metrics=None"
     dup = m.get("dup") or []
-    return ("chars=%d/%d(ratio=%.2f %s) cover=%.2f seq=%.2f uniq=%d/%d(%.2f %s) dup=%s" % (
-        int(m.get("chars") or 0), int(m.get("expected") or 0), float(m.get("ratio") or 0),
-        "OK" if m.get("chars_ok") else "BAD", float(m.get("cover") or 0),
-        float(m.get("seq") or 0), int(m.get("uniq") or 0),
-        int(m.get("uniq_expected") or 0), float(m.get("uniq_ratio") or 0),
-        "OK" if m.get("uniq_ok") else "BAD", ("有" + "".join(dup)) if dup else "无"))
+    return ("chars=%d/%d(ratio=%.2f %s) cover=%.2f(thr=%.2f) seq=%.2f(thr=%.2f) "
+            "uniq=%d/%d(%.2f %s) dup=%s thr=%s 去标点=%r" % (
+                int(m.get("chars") or 0), int(m.get("expected") or 0),
+                float(m.get("ratio") or 0), "OK" if m.get("chars_ok") else "BAD",
+                float(m.get("cover") or 0), float(m.get("thr_cover") or 0),
+                float(m.get("seq") or 0), float(m.get("thr_seq") or 0),
+                int(m.get("uniq") or 0), int(m.get("uniq_expected") or 0),
+                float(m.get("uniq_ratio") or 0), "OK" if m.get("uniq_ok") else "BAD",
+                ("有" + "".join(dup)) if dup else "无",
+                m.get("level") or "-", str(m.get("core") or "")[:40]))
 
 
 def verify_input_text(img, geom, expected, ctx):
-    """对输入框区域做 OCR，用三重判据严格校验；返回 (ok, detail, best_metrics, texts)。"""
+    """对输入框区域做 OCR，用「去标点 + 长度自适应阈值」的三重判据校验。
+
+    返回 (ok, detail, best_metrics, texts)。
+    """
     texts = ocr_candidates(img, geom["input"], ctx, max_plans=3)
     best = None
     for raw in texts or []:
         for part in re.split(r"[|\n]", str(raw)):
-            if not _norm_for_verify(part):
+            norm_part = _norm_for_verify(part)
+            if not _strip_verify_punct(norm_part):
                 continue
             m = input_text_metrics(expected, part)
             if best is None or m["seq"] > best["seq"]:
@@ -2673,17 +2729,17 @@ def verify_input_text(img, geom, expected, ctx):
     ok = best["ok"]
     bad = []
     if not best["chars_ok"]:
-        bad.append("字符数比例不符")
-    if best["cover"] < INPUT_MIN_COVER:
-        bad.append("字符集覆盖不足")
-    if best["seq"] < INPUT_MIN_SEQ:
-        bad.append("顺序/内容不一致")
+        bad.append("字符数比例不符(%.2f vs 档位)" % float(best.get("ratio") or 0))
+    if best["cover"] < float(best.get("thr_cover") or INPUT_MIN_COVER):
+        bad.append("字符集覆盖不足(%.2f<%.2f)" % (best["cover"], best.get("thr_cover")))
+    if best["seq"] < float(best.get("thr_seq") or INPUT_MIN_SEQ):
+        bad.append("顺序/内容不一致(%.2f<%.2f)" % (best["seq"], best.get("thr_seq")))
     if not best.get("uniq_ok"):
         bad.append("去重字符数超标")
     if best.get("dup"):
         bad.append("出现成对重复标点(%s)" % "".join(best["dup"]))
-    return ok, ("三重校验通过" if ok else "三重校验不通过（%s）" % "、".join(bad)), best, texts
-
+    return ok, ("校验通过（档位 %s）" % best.get("level") if ok
+                else "校验不通过（档位 %s；%s）" % (best.get("level"), "、".join(bad))), best, texts
 
 def _clipboard_restore_enabled(cfg):
     """剪贴板是否还原：2026-10-26 用户明确说「完事其实不用还原我的剪贴板」，默认 false。"""
@@ -2691,6 +2747,33 @@ def _clipboard_restore_enabled(cfg):
         return bool(((cfg or {}).get("reply") or {}).get("restoreClipboard", False))
     except Exception:
         return False
+
+
+# ───────────────── 输入框像素差兜底（2026-10-27 用户实测修复 bug 2） ─────────────────
+# 现象：剪贴板粘贴后偶发「输入框 OCR=''（chars=0/6）」-> 旧逻辑 type-verify-failed 误 abort，
+#       但用户其实已经看到文字打进去了。原因可能：粘贴生效但 OCR 对小字短文本失效、
+#       或输入框区域定位偶发偏移、或截图时机太早。
+# 修法（两层兜底，不削弱安全底线）：
+#   ① 输入前先拍「清空后的输入框」做像素差基线；输入后再拍一次算输入框区域像素差。
+#   ② OCR 读到空（chars==0）但像素差显著（>= 阈值）-> 说明内容确实进去了（OCR 失效），
+#      记 WARN 后**继续走发送前校验**，不 abort。发送前的标题校验 + 前台复检 + 硬超时仍然把关。
+#   ③ 像素差也很小（真的没粘上）-> 点一下输入框 + 清空后重试一次；两次都不行才 abort。
+#   日志统一打印 pixdiff / ocrChars / retry 三个值，便于以后判断。
+INPUT_PIXDIFF_MIN = 0.002
+
+
+def _input_pixdiff_min(cfg):
+    """输入框像素差阈值：config.reply.inputPixelDiffMin，可被环境变量 REPLY_INPUT_PIXDIFF_MIN 覆盖（测试用）。"""
+    env = str(os.environ.get("REPLY_INPUT_PIXDIFF_MIN") or "").strip()
+    if env:
+        try:
+            return float(env)
+        except Exception:
+            pass
+    try:
+        return float(((cfg or {}).get("reply") or {}).get("inputPixelDiffMin", INPUT_PIXDIFF_MIN))
+    except Exception:
+        return INPUT_PIXDIFF_MIN
 
 
 def clear_input_and_type(ctx, hwnd, text, clip, attempt):
@@ -2704,9 +2787,10 @@ def clear_input_and_type(ctx, hwnd, text, clip, attempt):
         use_clip = False
     elif force == "clipboard":
         use_clip = True
-    log("  输入方式: %s（len=%d 全角敏感=%s force=%s）" % (
+    pixdiff_min = _input_pixdiff_min(getattr(ctx, "config", None))
+    log("  输入方式: %s（len=%d 全角敏感=%s force=%s pixdiff_min=%.4f）" % (
         "剪贴板粘贴 Ctrl+V" if use_clip else "SendInput 逐字注入",
-        len(text), any(ch in FULLWIDTH_SENSITIVE for ch in text), force or "-"))
+        len(text), any(ch in FULLWIDTH_SENSITIVE for ch in text), force or "-", pixdiff_min))
 
     def _clear():
         ctx.guard.tap(VK_A, mods=(VK_CONTROL,))
@@ -2714,23 +2798,45 @@ def clear_input_and_type(ctx, hwnd, text, clip, attempt):
         ctx.guard.tap(VK_DELETE)
         ctx.sleep(0.1)
 
-    # 2026-10-26 23:3x：先点一下输入框确保焦点在输入框（实测某些路径打开会话后焦点不在输入框，
-    # Ctrl+A/Delete 清不掉旧草稿、输入也可能丢）；只点微信窗口内部，不会发送任何东西。
-    # 注入保护：点击/清空/粘贴/打字每一步之前都复查「前台=目标微信」，否则 abort 零注入。
-    check_injection_foreground("清空输入框前")
-    try:
-        _img0 = capture_window(ctx, hwnd)
-        _geom0 = geom_of(_img0, scale)
-        _l, _t, _r, _b = watcher.window_rect(hwnd)
-        _ix = int((float(_geom0["input"][0]) + float(_geom0["input"][2])) / 2.0)
-        _iy = int((float(_geom0["input"][1]) + float(_geom0["input"][3])) / 2.0)
-        ctx.checkpoint("点击输入框前")
-        ctx.guard.click_at(_l + _ix, _t + _iy)
-        ctx.sleep(0.15)
-    except ReplyAbort:
-        raise
-    except Exception as _exc:
-        log("  [输入] 点击输入框失败（仍继续输入）: %s" % _exc)
+    def _click_input(tag="点击输入框"):
+        """点一下输入框确保焦点（实测某些路径打开会话后焦点不在输入框）。
+
+        只点微信窗口内部中心点，不会发送任何东西；注入保护在点击前复查「前台=目标微信」。
+        """
+        check_injection_foreground("点击输入框前")
+        try:
+            _img0 = capture_window(ctx, hwnd)
+            _geom0 = geom_of(_img0, scale)
+            _l, _t, _r, _b = watcher.window_rect(hwnd)
+            _ix = int((float(_geom0["input"][0]) + float(_geom0["input"][2])) / 2.0)
+            _iy = int((float(_geom0["input"][1]) + float(_geom0["input"][3])) / 2.0)
+            ctx.checkpoint(tag)
+            ctx.guard.click_at(_l + _ix, _t + _iy)
+            ctx.sleep(0.15)
+            return True
+        except ReplyAbort:
+            raise
+        except Exception as _exc:
+            log("  [输入] %s 失败（仍继续输入）: %s" % (tag, _exc))
+            return False
+
+    def _empty_baseline(tag):
+        """拍「清空后的输入框」像素差基线；失败返回 None（像素差兜底不可用，退回纯 OCR 校验）。"""
+        try:
+            _img = capture_window(ctx, hwnd)
+            _geom = geom_of(_img, scale)
+            return {"img": _img, "box": tuple(_geom["input"]), "tag": tag}
+        except Exception as _exc:
+            log("  [输入] 拍 %s 基线失败（像素差兜底不可用）: %s" % (tag, _exc))
+            return None
+
+    def _input_region_diff(baseline, img2, geom2):
+        if not baseline:
+            return None
+        try:
+            return region_diff_ratio(baseline["img"], img2, geom2["input"])
+        except Exception:
+            return None
 
     def _paste():
         check_injection_foreground("粘贴正文前")
@@ -2744,28 +2850,49 @@ def clear_input_and_type(ctx, hwnd, text, clip, attempt):
         ctx.sleep(0.35)
         return True
 
-    def _capture_and_verify(tag):
+    def _capture_and_verify(tag, baseline=None, retry=0):
         img2 = capture_window(ctx, hwnd)
         geom2 = geom_of(img2, scale)
         ok2, detail2, metrics2, texts2 = verify_input_text(img2, geom2, text, ctx)
-        log("  输入校验(%s): OCR=%r" % (tag, " | ".join(str(t) for t in (texts2 or []))[:150]))
+        ocr_chars = int((metrics2 or {}).get("chars") or 0) if isinstance(metrics2, dict) else 0
+        pixdiff = _input_region_diff(baseline, img2, geom2)
+        evidence = "ocr" if ok2 else "none"
+        # 🔴 2026-10-27 用户实测：短文本+中文标点会被 OCR 漏读标点/个别字误判（chars=5/5 但 cover 0.75）。
+        #   像素差兜底必须对「所有 OCR 判不过」生效（不只是 OCR 读到空）：
+        #   粘贴/输入前后输入框像素差显著 = 内容确实进去了 -> evidence=pixdiff，继续走发送前校验。
+        #   发送前的 标题校验 + 前台复检 + 硬超时 仍然把关（没放宽 Enter 前的安全底线）。
+        if (not ok2) and pixdiff is not None and pixdiff >= pixdiff_min:
+            evidence = "pixdiff"
+            ok2 = True
+            detail2 = "pixdiff-evidence(ocrChars=%d; %s)" % (ocr_chars, detail2)
+            log("  [输入像素差兜底] OCR 判不过（ocrChars=%d），但输入框像素差 %.4f >= %.4f "
+                "-> 判定内容已输入，不 abort（继续发送前校验）" % (ocr_chars, pixdiff, pixdiff_min))
+        log("  输入校验(%s): OCR=%r | pixdiff=%s ocrChars=%d retry=%d threshold=%.4f evidence=%s" % (
+            tag, " | ".join(str(t) for t in (texts2 or []))[:150],
+            ("%.4f" % pixdiff) if pixdiff is not None else "None",
+            ocr_chars, retry, pixdiff_min, evidence))
         log("  输入校验判据(%s): %s -> ok=%s detail=%s" % (
             tag, _fmt_input_metrics(metrics2), ok2, detail2))
-        return img2, geom2, ok2, "%s %s %s" % (tag, detail2, _fmt_input_metrics(metrics2))
+        return img2, geom2, ok2, "%s [evidence=%s] %s %s" % (
+            tag, evidence, detail2, _fmt_input_metrics(metrics2))
 
+    _click_input("清空输入框前")
     _clear()
+    baseline = _empty_baseline("清空后")
     if use_clip:
         if not _paste():
             return (capture_window(ctx, hwnd), geom_of(capture_window(ctx, hwnd), scale),
                     False, "clipboard-set-failed")
-        img, geom, ok, detail = _capture_and_verify("剪贴板")
+        img, geom, ok, detail = _capture_and_verify("剪贴板", baseline, retry=0)
         if ok:
             return img, geom, True, "clipboard-paste-verified " + detail
-        # 剪贴板粘贴校验不过 -> 允许清空后再粘贴重来一次（仍不过就交给外层 abort）
-        log("  剪贴板粘贴校验不通过 -> 清空后重试一次")
+        # OCR 判不过 且 像素差也小 = 真的没粘上/没输进去 -> 点一下输入框 + 清空后重试一次（仍不过才 abort）
+        log("  剪贴板粘贴校验不通过（OCR 判不过且像素差不足，判定没粘上）-> 点击输入框后重试一次")
+        _click_input("重试粘贴前点击输入框")
         _clear()
+        baseline2 = _empty_baseline("重试清空后")
         if _paste():
-            img, geom, ok, detail2 = _capture_and_verify("剪贴板重试")
+            img, geom, ok, detail2 = _capture_and_verify("剪贴板重试", baseline2, retry=1)
             if ok:
                 return img, geom, True, "clipboard-paste-verified(2nd) " + detail2
             return img, geom, False, "剪贴板粘贴两次校验均不过: " + detail2
@@ -2774,14 +2901,16 @@ def clear_input_and_type(ctx, hwnd, text, clip, attempt):
     check_injection_foreground("输入正文前")
     ctx.guard.type_unicode(text)
     ctx.sleep(0.25)
-    img, geom, ok, detail = _capture_and_verify("SendInput")
+    img, geom, ok, detail = _capture_and_verify("SendInput", baseline, retry=0)
     if ok:
         return img, geom, True, "sendinput-unicode-verified " + detail
     # SendInput 校验不过 -> 改用剪贴板重试一次（长/敏感文本本来就走剪贴板，这里是短文本兜底）
     log("  SendInput 校验不通过 -> 改用剪贴板粘贴重试一次")
+    _click_input("兜底粘贴前点击输入框")
     _clear()
+    baseline3 = _empty_baseline("兜底清空后")
     if _paste():
-        img, geom, ok, detail2 = _capture_and_verify("剪贴板兜底")
+        img, geom, ok, detail2 = _capture_and_verify("剪贴板兜底", baseline3, retry=1)
         if ok:
             return img, geom, True, "clipboard-paste-verified(fallback) " + detail2
         return img, geom, False, "SendInput+剪贴板两次校验均不过: " + detail2
@@ -2822,6 +2951,647 @@ def restore_previous_foreground(ctx, wechat_hwnd, user_back=False):
             log("已把前台还原给原窗口 hwnd=%s（0 鼠标）" % hex(prev))
     except Exception:
         pass
+
+
+# ───────────────── 只读：打开会话读聊天区最后几条对方消息（2026-10-27 新增） ─────────────────
+# 背景：watcher 取「对方说了什么」原来用会话列表小字预览 OCR，真机实测读成乱码
+#   （「在吗/今晚吃什么/火锅还是烧烤」->「天钠还十距闭」），模型只能回「没看懂」。
+# 现在改为：watcher 子进程调用 `reply.py --read-msg --chat X`，复用成熟的「切前台 + Ctrl+F +
+#   受控点击会话行 + 标题校验」打开会话，然后 OCR 聊天区底部气泡，按左右位置区分
+#   「对方发送(in) / 自己发送(out)」，取最后 N 条 in 气泡返回。**只读：不输入、不按 Enter。**
+
+def _row_text_variants(row):
+    """一行 OCR 的候选文本（去噪后去重）。"""
+    out = []
+    for v in (row.get("variants") or []):
+        vv = _clean_row_text(v)
+        if vv and vv not in out:
+            out.append(vv)
+    if not out:
+        t = _clean_row_text(row.get("text") or "")
+        if t:
+            out = [t]
+    return out
+
+
+def _bubble_side(row, left, right):
+    """按气泡在聊天区里的水平位置判断方向：in=对方（靠左）/ out=自己（靠右）/ center=系统/时间。"""
+    width = max(1.0, float(right) - float(left))
+    try:
+        x0 = float(row.get("x0") or left)
+        x1 = float(row.get("x1") or right)
+    except Exception:
+        return "center"
+    left_gap = (x0 - float(left)) / width
+    right_gap = (float(right) - x1) / width
+    if left_gap <= 0.24 and left_gap <= right_gap:
+        return "in"
+    if right_gap <= 0.24:
+        return "out"
+    return "center"
+
+
+_TIMESTAMP_RE = re.compile(
+    r"^(\d{1,2}:\d{2}|(昨天|前天|今天|星期[一二三四五六日天])\s*(\d{1,2}:\d{2})?"
+    r"|\d{4}[/\-年]\d{1,2}[/\-月]\d{1,2}.*)$")
+_SYSTEM_ROW_RE = re.compile(
+    r"正在输入|以上是历史消息|查看更多消息|以下为新消息|消息已发出|对方开启了朋友验证|"
+    r"加入了群聊|撤回了一条消息|退出了群聊|修改群名")
+
+
+def _filter_bubble_rows(rows):
+    """过滤时间戳/系统提示/噪声行，只留可能的消息气泡文字行。"""
+    kept = []
+    for r in rows:
+        vs = _row_text_variants(r)
+        if not vs:
+            continue
+        txt = vs[0].strip()
+        if _TIMESTAMP_RE.match(txt):
+            continue
+        if _SYSTEM_ROW_RE.search(txt):
+            continue
+        if len(re.findall(r"[\w\u4e00-\u9fff]", txt)) < 1:
+            continue
+        if max(len(v) for v in vs) > 300:
+            continue
+        kept.append(r)
+    return kept
+
+
+def _best_variant_text(rows):
+    """把同一气泡的多行文字合成一段：每行取「和其他候选最一致」的变体。"""
+    parts = []
+    for r in rows:
+        vs = _row_text_variants(r)
+        if not vs:
+            continue
+        if len(vs) == 1:
+            parts.append(vs[0])
+            continue
+        best = vs[0]
+        best_score = -1.0
+        for i, a in enumerate(vs):
+            score = 0.0
+            for j, b in enumerate(vs):
+                if i == j:
+                    continue
+                try:
+                    score += difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
+                except Exception:
+                    pass
+            if score > best_score:
+                best, best_score = a, score
+        parts.append(best)
+    text = " ".join(p for p in parts if p).strip()
+    return re.sub(r"\s{2,}", " ", text)
+
+
+def _group_rows_into_bubbles(rows, left, right):
+    """把 OCR 行聚成气泡。
+
+    2026-10-27 用户实测（长消息换行被读碎）修复：
+      微信里一条长消息会折成多行，同一气泡内行距 ≈ 一个字高；不同消息之间会多出气泡内边距+外边距。
+      这里先从「同方向 + 左缘对齐」的相邻行 gap 里估计**气泡内行距 intra**（取较小一半的中位数），
+      再用 split_gap = intra*1.6 作为切分阈值 —— 行距明显大于气泡内行距才切成新气泡。
+    """
+    rows = sorted(rows, key=lambda r: float(r.get("y") or 0))
+    if not rows:
+        return []
+    heights = []
+    for r in rows:
+        try:
+            heights.append(max(1.0, float(r.get("bottom") or 0) - float(r.get("top") or 0)))
+        except Exception:
+            pass
+    med = sorted(heights)[len(heights) // 2] if heights else 20.0
+    width = max(1.0, float(right) - float(left))
+    align_tol = max(10.0, 0.02 * width)
+    # 估「气泡内行距」：同方向且左缘对齐的相邻行 gap，取较小一半的中位数
+    intra_cands = []
+    prev = None
+    for r in rows:
+        side = _bubble_side(r, left, right)
+        try:
+            y = float(r.get("y") or 0)
+            x0 = float(r.get("x0") or left)
+        except Exception:
+            continue
+        if prev is not None and side == prev["side"] and side in ("in", "out") \
+                and abs(x0 - prev["x0"]) <= align_tol:
+            intra_cands.append(max(1.0, y - prev["y"]))
+        prev = {"side": side, "y": y, "x0": x0}
+    intra = med * 1.25
+    if intra_cands:
+        intra_cands.sort()
+        half = intra_cands[:max(1, len(intra_cands) // 2)]
+        intra = sorted(half)[len(half) // 2]
+    split_gap = max(intra * 1.6, med * 1.8, 26.0)
+    bubbles = []
+    for r in rows:
+        side = _bubble_side(r, left, right)
+        y = float(r.get("y") or 0)
+        x0 = float(r.get("x0") or left)
+        x1 = float(r.get("x1") or right)
+        bottom = float(r.get("bottom") or y)
+        if bubbles and side == bubbles[-1]["side"] and side in ("in", "out"):
+            gap = y - bubbles[-1]["last_y"]
+            same_left = abs(x0 - bubbles[-1]["x0"]) <= align_tol
+            if gap < split_gap and same_left:
+                bubbles[-1]["rows"].append(r)
+                bubbles[-1]["last_y"] = y
+                bubbles[-1]["x0"] = min(bubbles[-1]["x0"], x0)
+                bubbles[-1]["x1"] = max(bubbles[-1]["x1"], x1)
+                bubbles[-1]["bottom"] = max(bubbles[-1]["bottom"], bottom)
+                continue
+        bubbles.append({"side": side, "rows": [r], "y": y, "last_y": y,
+                        "x0": x0, "x1": x1, "bottom": bottom})
+    return bubbles
+
+
+def _ocr_bubble_text_precise(img, top, bottom, x0, x1):
+    """对单个气泡的文字区做「深色像素紧裁 + 2x/3x 放大 + psm7/6 精读」，返回候选文本列表。
+
+    2026-10-27 实测：整块聊天区 OCR 对短句会串行/丢字（「在吗」读成「在本」，
+    「今晚吃什么」读成「今什么」）；对每个气泡单独紧裁后 psm7 精读明显更准。
+    注意聊天区是**浅色背景 + 深色文字**（与搜索下拉相反），所以主路径不反色。
+    只做只读 OCR（临时图写在 tmp-ocr/，用完即删）。
+    """
+    W, H = img.size
+    bx0 = max(0, int(float(x0) - 3))
+    bx1 = min(W, int(float(x1) + 3))
+    by0 = max(0, int(float(top) - 3))
+    by1 = min(H, int(float(bottom) + 3))
+    if bx1 - bx0 < 6 or by1 - by0 < 6:
+        return []
+    try:
+        crop = img.crop((bx0, by0, bx1, by1))
+        rgb = np.array(crop)
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    except Exception:
+        return []
+    # 再用「深色像素」把文字区裁紧，去掉气泡边缘/尾巴/头像残留（这些会被 OCR 成噪声字符）
+    try:
+        th = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)[1]
+        ys, xs = np.where(th > 0)
+        if len(xs) >= 8 and len(ys) >= 4:
+            px0 = max(0, int(xs.min()) - 4)
+            px1 = min(gray.shape[1], int(xs.max()) + 5)
+            py0 = max(0, int(ys.min()) - 4)
+            py1 = min(gray.shape[0], int(ys.max()) + 5)
+            if px1 - px0 >= 6 and py1 - py0 >= 6:
+                gray = gray[py0:py1, px0:px1]
+    except Exception:
+        pass
+    norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+    inv = cv2.bitwise_not(norm)
+    tess = tesseract_bin()
+    tmp_dir = os.path.join(BASE_DIR, "tmp-ocr")
+    out = []
+    # 主路径：不反色（浅底深字），2x/3x 放大 + psm7 单行 / psm6 段落；反色只作最后兜底
+    variants = (("norm2x", norm, 2.0), ("norm3x", norm, 3.0), ("inv2x", inv, 2.0))
+    for tag, arr, zoom in variants:
+        try:
+            big = cv2.resize(arr, None, fx=zoom, fy=zoom, interpolation=cv2.INTER_CUBIC)
+            big = cv2.copyMakeBorder(big, 14, 14, 14, 14, cv2.BORDER_CONSTANT, value=255)
+        except Exception:
+            continue
+        for psm in (7, 6):
+            path = ""
+            try:
+                os.makedirs(tmp_dir, exist_ok=True)
+                fd, path = tempfile.mkstemp(prefix="bubble-", suffix=".png", dir=tmp_dir)
+                os.close(fd)
+                from PIL import Image as _Image
+                _Image.fromarray(big).save(path)
+                p = subprocess.run(
+                    [tess, path, "stdout", "-l", "chi_sim", "--psm", str(psm),
+                     "--oem", "1", "--dpi", "300"],
+                    capture_output=True, timeout=8.0, creationflags=0x08000000)
+                txt = (p.stdout.decode("utf-8", "replace") or "").strip()
+                txt = re.sub(r"\s+", " ", txt)
+                if txt and txt not in out:
+                    out.append(txt)
+            except Exception:
+                continue
+            finally:
+                try:
+                    if path:
+                        os.remove(path)
+                except Exception:
+                    pass
+    log("  [READ] 气泡精读 crop=(%d,%d,%d,%d) 候选=%r" % (bx0, by0, bx1, by1, out[:8]))
+    return out
+
+
+def _clean_candidate_text(t):
+    """去掉 OCR 候选里的头像/图标噪声 token 和尾部标点（如 'ea4 火锅还是烧烤' -> '火锅还是烧烤'）。"""
+    t = str(t or "").strip()
+    if not t:
+        return ""
+    toks = t.split()
+    def _is_noise_tok(x):
+        # 2026-10-27：只把 1~4 字符的短 ASCII 串当噪声（头像/图标被 OCR 成的 ea4/上4/OO）；
+        #   6 位以上纯数字是密码（远程指令要用），绝不能当噪声剥掉。
+        return bool(re.fullmatch(r"[A-Za-z\?\!\.\,;:'\"\-_/\\\|~`]{1,4}", x)) \
+            or bool(re.fullmatch(r"[A-Za-z0-9]{1,3}", x))
+    while len(toks) > 1 and _is_noise_tok(toks[0]):
+        toks.pop(0)
+    while len(toks) > 1 and _is_noise_tok(toks[-1]):
+        toks.pop()
+    t = " ".join(toks).strip()
+    t = re.sub(r"[\?\!\.\,;:'\"]+$", "", t).strip()
+    t = re.sub(r"^[\?\!\.\,;:'\"]+", "", t).strip()
+    return t
+
+
+def _consensus_candidates(cands):
+    """多候选「按位多数投票」合成一条：同一行多遍 OCR 各错不同字时能把正确字投回来。"""
+    from collections import Counter
+    cleaned = []
+    for c in cands or []:
+        c = _clean_candidate_text(c)
+        if c and c not in cleaned:
+            cleaned.append(c)
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+    # 以「候选长度众数」为基准（同长度才能按位投票）；并列时取更长
+    lens = Counter(len(c) for c in cleaned)
+    mode_len = max(lens.items(), key=lambda kv: (kv[1], kv[0]))[0]
+    group = [c for c in cleaned if len(c) == mode_len]
+    if len(group) == 1:
+        return group[0]
+    out = []
+    for i in range(mode_len):
+        counter = Counter(c[i] for c in group)
+        # 票数相同 -> 取「更靠前候选」的字符（调用方把精读候选放最前，质量最高）
+        best_ch, best_votes, best_idx = "", -1, 999
+        for ch, votes in counter.items():
+            idx = next((k for k, g in enumerate(group) if g[i] == ch), 999)
+            if votes > best_votes or (votes == best_votes and idx < best_idx):
+                best_ch, best_votes, best_idx = ch, votes, idx
+        out.append(best_ch)
+    return "".join(out)
+
+
+def _estimate_bubble_capacity(rows):
+    """按气泡内每行的像素宽度粗估「这条气泡大概有多少个字」。
+
+    中文字宽 ≈ 字高（用行高的 0.7 倍近似，含行间距），容量 = 各行宽度之和 / 字宽。
+    只用于「整块 vs 精读」候选的择优参考，不追求精确。
+    """
+    widths, heights = [], []
+    for r in rows or []:
+        try:
+            widths.append(max(1.0, float(r.get("x1") or 0) - float(r.get("x0") or 0)))
+            heights.append(max(1.0, float(r.get("bottom") or 0) - float(r.get("top") or 0)))
+        except Exception:
+            pass
+    if not widths:
+        return 0
+    med_h = sorted(heights)[len(heights) // 2] if heights else 20.0
+    # 实测（125% 缩放）行 bbox 高约 44px，而中文字宽约 22px（≈ font size）-> 用 0.5 倍行高估字宽
+    char_w = max(10.0, med_h * 0.5)
+    return int(round(sum(widths) / char_w))
+
+
+def _pick_bubble_text(base_text, precise_cands, row_variants, expected_chars=None):
+    """从「整块 OCR（多行已按 y 拼接）+ 气泡紧裁精读候选 + 行级变体」里挑最可信的一条。
+
+    2026-10-27 用户实测（长任务消息被读成「人和」「件」碎片）修复：
+      ① 候选全部清洗去重，并**剔除被更长候选完整包含的碎片**；
+      ② 质量优先（watcher.ocr_text_quality 通过）；
+      ③ 有像素容量估计时：选字符数**明显更接近容量**的候选，否则选**字符数最多**的候选；
+      ④ 硬规则：采用结果字符数不得低于最长候选的 50%，否则退回最长候选
+         （杜绝「整块 60 字最后采用 1 字」）；
+      ⑤ 日志打出采用的候选、理由、全部候选的字符数（便于排查）。
+    返回 (text, why)。
+    """
+    prec = []
+    for t in (precise_cands or []):
+        t = _clean_candidate_text(t)
+        if t and t not in prec:
+            prec.append(t)
+    base = _clean_candidate_text(base_text)
+    cands = []
+    for t in ([base] if base else []) + prec + [
+            _clean_candidate_text(v) for v in (row_variants or [])]:
+        t = str(t or "").strip()
+        if t and t not in cands:
+            cands.append(t)
+    if not cands:
+        return "", "empty"
+    # 剔除碎片：被更长候选完整包含（或 90% 相似但短很多）的候选不参与择优
+    pruned = []
+    for t in cands:
+        is_frag = False
+        for o in cands:
+            if o == t:
+                continue
+            if t in o and len(t) < len(o):
+                is_frag = True
+                break
+            if len(t) < 0.8 * len(o):
+                try:
+                    if difflib.SequenceMatcher(None, t, o, autojunk=False).ratio() >= 0.9:
+                        is_frag = True
+                        break
+                except Exception:
+                    pass
+        if not is_frag:
+            pruned.append(t)
+    cands = pruned or cands
+    if len(cands) == 1:
+        return cands[0], "only-candidate"
+    # 质量优先
+    pool = []
+    for t in cands:
+        try:
+            q_ok, _q = watcher.ocr_text_quality(t)
+        except Exception:
+            q_ok = True
+        if q_ok:
+            pool.append(t)
+    pool = pool or cands
+    longest = max(cands, key=len)
+    cap = int(expected_chars or 0)
+    pick, why = longest, "longest(无容量估计)"
+    if cap > 0:
+        cand = min(pool, key=lambda t: abs(len(t) - cap))
+        diff = abs(len(cand) - cap)
+        # 「明显更接近容量」：偏差 ≤ max(3字, 20%容量)，且不能比最长候选短太多（≥80% 最长）
+        #   否则说明容量估计不可靠（长消息折行/中英混排），直接取字符数最多的候选
+        if diff <= max(3, int(cap * 0.2)) and len(cand) >= int(len(longest) * 0.8):
+            pick, why = cand, "capacity(≈%d字)" % cap
+        else:
+            pick, why = longest, "longest(容量估计不可靠/候选不可信)"
+    # 硬规则（用户明确要求）：采用结果字符数不得低于最佳候选（最长）的 50%
+    if len(pick) < max(2, int(len(longest) * 0.5)):
+        pick, why = longest, "fallback-longest(采用候选<最长50%)"
+    try:
+        log("  [READ] 气泡选词：采用=%r（%s）；候选字符数=%s；最长=%d；容量≈%s"
+            % (pick[:80], why, [(len(t), t[:14]) for t in cands[:10]],
+               len(longest), cap if cap else "-"))
+    except Exception:
+        pass
+    return pick, why
+
+
+def _merge_duplicate_rows(rows, y_tol=8.0):
+    """两种极性各跑一遍 OCR 会有同一行出现两次：按 y 相近 + 横向重叠合并成一行（保留所有变体）。"""
+    rows = sorted(rows, key=lambda r: float(r.get("y") or 0))
+    out = []
+    for r in rows:
+        hit = None
+        try:
+            y = float(r.get("y") or 0)
+            x0 = float(r.get("x0") or 0)
+            x1 = float(r.get("x1") or 0)
+        except Exception:
+            continue
+        for m in out:
+            if abs(float(m.get("y") or 0) - y) > y_tol:
+                continue
+            mx0 = float(m.get("x0") or 0)
+            mx1 = float(m.get("x1") or 0)
+            if x1 < mx0 - 30 or x0 > mx1 + 30:
+                continue
+            hit = m
+            break
+        if hit is None:
+            out.append(dict(r))
+            continue
+        vs = list(hit.get("variants") or [])
+        for v in (r.get("variants") or []):
+            if v not in vs:
+                vs.append(v)
+        hit["variants"] = vs
+        hit["x0"] = min(float(hit.get("x0") or x0), x0)
+        hit["x1"] = max(float(hit.get("x1") or x1), x1)
+        try:
+            hit["top"] = min(float(hit.get("top") or r.get("top") or y), float(r.get("top") or y))
+            hit["bottom"] = max(float(hit.get("bottom") or y), float(r.get("bottom") or y))
+        except Exception:
+            pass
+    return out
+
+
+def read_chat_incoming_bubbles(ctx, img, geom, max_bubbles=3, crop_out=""):
+    """从聊天区（只看下半部分）OCR 气泡文字，返回最后 N 条「对方发送」的文本。
+
+    2026-10-27 多模态升级：crop_out 非空时，把「OCR 用的聊天区底部区域」原样另存为 PNG，
+    供 watcher 直接发给多模态模型看图（OCR 只作参考）。只读，不输入、不发送。
+
+    2026-10-27 实测改进：
+      * 聊天区是浅色背景 + 深色文字，和搜索下拉（深底浅字）相反 —— 两种极性都跑一遍，
+        行级变体合并后一起聚类，用「多遍一致」压掉单个 OCR 的随机错字；
+      * 排除左右两列头像区（彩色头像会被 OCR 成 ea4/上4/2 这类噪声前缀）；
+      * 每个气泡再用「深色像素紧裁 + 2x/3x + psm7 单行精读」补一次。
+
+    返回 {"bubbles": [{"text","variants","y","x0","x1"}], "rows_total": n}。
+    只读：此函数不做任何键鼠动作（只在已有窗口截图上 OCR）。
+    """
+    W, H = img.size
+    try:
+        cx0, cy0, cx1, cy1 = [int(v) for v in geom["chat"]]
+    except Exception:
+        return {"bubbles": [], "rows_total": 0, "error": "no-chat-geometry"}
+    cx0 = max(0, min(W, cx0)); cx1 = max(0, min(W, cx1))
+    cy0 = max(0, min(H, cy0)); cy1 = max(0, min(H, cy1))
+    if cx1 - cx0 < 80 or cy1 - cy0 < 80:
+        return {"bubbles": [], "rows_total": 0, "error": "chat-region-too-small"}
+    try:
+        s = float(geom.get("s") or 1.0)
+    except Exception:
+        s = 1.0
+    avatar = max(24, int(44 * s))     # 左/右头像列宽度（物理像素）
+    left, right = cx0 + avatar, cx1 - avatar
+    top = cy0 + int((cy1 - cy0) * 0.18)
+    box = (max(0, int(left)), max(0, int(top)), min(W, int(right)), min(H, int(cy1)))
+    log("  [READ] OCR 聊天区底部气泡 区域=(%d,%d,%d,%d)（已排除左右头像列 %dpx）期望最多 %d 条对方消息"
+        % (box[0], box[1], box[2], box[3], avatar, max_bubbles))
+    crop_path, crop_size = "", [0, 0]
+    # 2026-10-27 多模态：把这块区域原样存成 PNG（通常 800x400 以上，满足模型短边>=64 要求）
+    if crop_out:
+        try:
+            _c = img.crop((box[0], box[1], box[2], box[3]))
+            _d = os.path.dirname(os.path.abspath(crop_out))
+            if _d:
+                os.makedirs(_d, exist_ok=True)
+            _c.save(crop_out, format="PNG")
+            crop_path = os.path.abspath(crop_out)
+            crop_size = [int(_c.size[0]), int(_c.size[1])]
+            log("  [READ] 聊天区裁剪图已保存: %s size=%dx%d（供 vision 模型看图）"
+                % (crop_path, crop_size[0], crop_size[1]))
+        except Exception as exc:
+            log("  [READ] 裁剪图保存失败（vision 将不可用）: %s" % exc)
+            crop_path, crop_size = "", [0, 0]
+    try:
+        dbg = str(os.environ.get("REPLY_READ_SAVE_IMG") or "").strip()
+        if dbg:
+            path_dbg = dbg.replace(".png", "") + "_scale%.2f.png" % s
+            img.save(path_dbg)
+            log("  [READ] 调试截图已保存: %s（geom.chat=%r）" % (path_dbg, geom.get("chat")))
+    except Exception:
+        pass
+    # 两种极性各跑一遍（浅底深字 / 深底浅字），行级合并后用「多遍一致」压错字
+    rows = []
+    for inv in (False, True):
+        try:
+            rr = _ocr_rows(img, box, ctx, psm=6, zoom=2.0, psms=(6, 11),
+                           include_orig=True, log_compare=(inv is False), invert=inv)
+        except Exception as exc:
+            log("  [READ] 极性 invert=%s OCR 失败: %s" % (inv, exc))
+            rr = []
+        log("  [READ] 聊天区 OCR(invert=%s) 行数=%d" % (inv, len(rr)))
+        rows.extend(rr)
+    rows_total = len(rows)
+    rows = _merge_duplicate_rows(rows)
+    log("  [READ] 去除两极性重复行后 行数=%d" % len(rows))
+    rows = _filter_bubble_rows(rows)
+    bubbles = _group_rows_into_bubbles(rows, left, right)
+    incoming = [b for b in bubbles if b["side"] == "in"]
+    log("  [READ] 气泡聚类: 行=%d 气泡=%d（in=%d out=%d center=%d）"
+        % (rows_total, len(bubbles), len(incoming),
+           sum(1 for b in bubbles if b["side"] == "out"),
+           sum(1 for b in bubbles if b["side"] == "center")))
+    incoming = incoming[-max(1, int(max_bubbles)):]
+    out = []
+    for b in incoming:
+        base_text = _best_variant_text(b["rows"])
+        row_variants = []
+        for r in b["rows"]:
+            for v in _row_text_variants(r):
+                if v not in row_variants:
+                    row_variants.append(v)
+        top_b = min(float(r.get("top") or b["y"]) for r in b["rows"])
+        bottom_b = max(float(r.get("bottom") or b["y"]) for r in b["rows"])
+        try:
+            precise = _ocr_bubble_text_precise(img, top_b, bottom_b, b["x0"], b["x1"])
+        except Exception as exc:
+            log("  [READ] 气泡精读失败（忽略）: %s" % exc)
+            precise = []
+        # 按气泡内每行的像素宽度估算「大概几个字」（多行长消息要按行累加，不能只看最宽一行）
+        expected_chars = _estimate_bubble_capacity(b["rows"])
+        if expected_chars < 1:
+            _bw = max(1.0, float(b["x1"]) - float(b["x0"]))
+            expected_chars = max(1, int(round(_bw / 18.0)))
+        if not precise:
+            log("  [READ] 气泡精读无候选 -> 退回整块多遍 OCR 结果（%r）" % base_text[:80])
+        text, how = _pick_bubble_text(base_text, precise, row_variants,
+                                      expected_chars=expected_chars)
+        log("  [READ] 对方气泡 y=%.0f x=[%.0f,%.0f] 整块=%r 精读=%r -> 采用=%r（%s）"
+            % (b["y"], b["x0"], b["x1"], base_text[:80], precise[:5], text[:160], how))
+        variants = []
+        for v in list(precise or []) + [base_text] + row_variants:
+            v = str(v or "").strip()
+            if v and v not in variants:
+                variants.append(v)
+        out.append({"text": text, "variants": variants[:10],
+                    "y": round(b["y"], 1), "x0": round(b["x0"], 1),
+                    "x1": round(b["x1"], 1), "side": "in", "how": how})
+    return {"bubbles": out, "rows_total": rows_total,
+            "crop": crop_path, "cropSize": crop_size}
+
+
+def run_read_messages(ctx, cfg, target, max_bubbles=3, crop_out=""):
+    """只读模式：打开会话 -> OCR 聊天区最后 N 条对方消息（可选另存裁剪图）-> 打印 JSON。
+
+    只读：不点输入框、不输入、不按 Enter。
+    """
+    target = (target or "").strip()
+    max_bubbles = max(1, min(5, int(max_bubbles or 3)))
+    crop_out = str(crop_out or "").strip()
+    match_cfg = (cfg.get("whitelistMatch") or {})
+    if not target:
+        print(json.dumps({"ok": False, "error": "--chat 不能为空"}, ensure_ascii=False))
+        return 2
+    log("task(read-msg): chat=%r max_bubbles=%d hard_timeout=%.0fs pid=%d"
+        % (target, max_bubbles, READ_TIMEOUT_SECONDS, os.getpid()))
+    log_stage("read-guard", "开始忙闲守护判断（前台 %s）" % fg_desc())
+    try:
+        guard = busyguard.evaluate(cfg)
+    except Exception as exc:
+        guard = {"busy": False, "detail": "busyguard-error: %s" % exc}
+    if guard.get("busy"):
+        log_stage("read-guard", "busy -> 不动作直接退出（reason=%s）" % guard.get("reason"))
+        print(json.dumps({"ok": False, "skip": "busy", "reason": guard.get("reason"),
+                          "detail": guard.get("detail"), "chat": target}, ensure_ascii=False))
+        return 0
+    log_stage("read-guard", "通过（只读判断，未注入任何输入）")
+    clip = Clip()
+    hwnd = None
+    try:
+        win = ensure_wechat_ready(ctx)
+        hwnd = win["hwnd"]
+        scale = watcher.dpi_scale_of(hwnd)
+        log("微信窗口: hwnd=%s size=%s（只读模式：不输入正文、不按 Enter）" % (hex(hwnd), win["size"]))
+        ctx.checkpoint("切前台前")
+        if not activate_window(ctx, hwnd):
+            raise ReplyAbort("focus-failed（无法把微信切到前台；只读模式未做任何发送）")
+        arm_injection_guard(hwnd, "read-msg")
+        check_injection_foreground("切前台后")
+        ctx.sleep(0.15)
+        img_cur = capture_window(ctx, hwnd)
+        geom_cur = geom_of(img_cur, scale)
+        opened = False
+        detail = ""
+        for attempt in range(1, 3):
+            ctx.checkpoint("搜索前" if attempt == 1 else "重新搜索前")
+            if attempt > 1:
+                esc_if_search_confirmed(ctx, "第 %d 次搜索前收尾上一次" % attempt)
+                ctx.sleep(0.1)
+                ctx.mark_search_open(False)
+                img_cur = capture_window(ctx, hwnd)
+                geom_cur = geom_of(img_cur, scale)
+            log_stage("read-search", "第 %d 次：Ctrl+F 搜索并打开会话 %r（前台 %s）"
+                      % (attempt, target, fg_desc()))
+            check_injection_foreground("搜索前再确认前台")
+            ok_search, _img_s = search_open_check(ctx, hwnd, geom_cur, img_cur, attempt)
+            if not ok_search:
+                raise ReplyAbort("search-not-opened（只读模式：未输入任何字符、未发送）")
+            opened, _confirmed, img, geom, detail = do_open_chat(
+                ctx, hwnd, target, match_cfg, attempt, clip)
+            if opened:
+                break
+            log_stage("read-search", "第 %d 次打开失败: %s" % (attempt, detail))
+        if not opened:
+            raise ReplyAbort("open-chat-failed（%s；只读模式，未输入、未发送）" % detail)
+        ctx.sleep(0.4)
+        img = capture_window(ctx, hwnd)
+        geom = geom_of(img, scale)
+        result = read_chat_incoming_bubbles(ctx, img, geom, max_bubbles=max_bubbles,
+                                            crop_out=crop_out)
+        print(json.dumps({"ok": True, "chat": target,
+                          "bubbles": result.get("bubbles") or [],
+                          "rowsTotal": result.get("rows_total"),
+                          "crop": result.get("crop") or "",
+                          "cropSize": result.get("cropSize") or [0, 0],
+                          "elapsed": round(ctx.elapsed(), 2)},
+                         ensure_ascii=False))
+        log_stage("read-done", "只读读取完成：%d 条对方消息（未输入、未发送）"
+                  % len(result.get("bubbles") or []))
+        return 0
+    except ReplyAbort as exc:
+        log_stage("read-abort", "阶段=%s 原因=%s（只读模式：已释放按键；未输入、未发送）"
+                  % (getattr(ctx, "step", "?"), exc))
+        log("abort(read-msg): %s" % exc)
+        print(json.dumps({"ok": False, "skip": str(exc), "chat": target,
+                          "elapsed": round(ctx.elapsed(), 2)}, ensure_ascii=False))
+        return 0
+    except Exception as exc:
+        log_error("read-msg 未捕获异常", exc)
+        print(json.dumps({"ok": False, "error": "%s: %s" % (type(exc).__name__, exc),
+                          "chat": target}, ensure_ascii=False))
+        return 1
+    finally:
+        try:
+            esc_if_search_confirmed(ctx, "read-msg 收尾")
+        except Exception:
+            pass
+        disarm_injection_guard()
 
 
 def run(ctx, args):
@@ -2943,21 +3713,16 @@ def run(ctx, args):
         typed_detail = ""
         typed_img = img
         typed_geom = geom
-        for attempt in range(1, 3):
-            ctx.checkpoint("输入前" if attempt == 1 else "重新输入前")
+        # 2026-10-27 用户实测：外层重试会二次清空重打，看着像"写了又擦" -> 外层不再重试，
+        #   只保留 clear_input_and_type 内部 1 次重试（最多写 2 遍）；仍不过直接 abort。
+        for attempt in range(1, 2):
+            ctx.checkpoint("输入前")
             log_stage("type", "第 %d 次：清空输入框 + 输入正文（前台 %s）" % (attempt, fg_desc()))
             typed_img, typed_geom, typed_ok, typed_detail = clear_input_and_type(
                 ctx, hwnd, text, clip, attempt)
             log_stage("type", "输入校验 ok=%s detail=%s" % (typed_ok, typed_detail))
             if typed_ok:
                 break
-            if attempt < 2:
-                # 🔴 2026-10-26 23:3x 紧急修复：删掉「Escape/Tab 切焦点后重试」这种盲操作
-                #   （实测会在前台被抢走时把键注入到别的窗口/切走焦点、甚至弄丢微信窗口）。
-                #   现在：不做任何焦点切换；下一轮 clear_input_and_type 开头会重新确认前台，
-                #   前台不是微信就直接 abort。
-                log("  输入未确认 -> 不做任何焦点切换；只在仍为微信前台时清空重来一次"
-                    "（前台=%s）" % fg_desc())
         typed_path = save_img(typed_img, "typed")
         log("输入后截图: %s（%s，等待发送）" % (typed_path, typed_detail))
         if not typed_ok:
@@ -3133,13 +3898,35 @@ def main(argv=None):
     watcher.set_dpi_aware()
     ap = argparse.ArgumentParser()
     ap.add_argument("--chat", required=True)
-    ap.add_argument("--text", required=True)
+    ap.add_argument("--text", default="")
     ap.add_argument("--match", default="")
     ap.add_argument("--dry-run", action="store_true")
+    # 2026-10-27：只读模式 —— 打开会话 + OCR 聊天区最后 N 条对方消息（不输入、不发送）。
+    #   watcher 用子进程调用它取「对方说了什么」（聊天区气泡字号大，比列表小字预览准得多）。
+    ap.add_argument("--read-msg", action="store_true",
+                    help="只打开会话并读取聊天区最后几条对方消息（只读：不输入、不发送）")
+    ap.add_argument("--max-bubbles", type=int, default=3,
+                    help="--read-msg 时最多返回几条对方消息（1-5，默认 3）")
+    ap.add_argument("--crop-out", default="",
+                    help="--read-msg 时把聊天区底部（含最后几条气泡）另存为 PNG，供多模态模型看图")
     args = ap.parse_args(argv)
     if args.match and args.match.strip() and args.match.strip() != args.chat.strip():
         log("提示: --match=%r 已忽略（v2 只用 --chat 名做键盘搜索）" % args.match)
     cfg = watcher.load_config()
+    if args.read_msg:
+        ctx = Ctx(cfg, timeout=READ_TIMEOUT_SECONDS)
+        try:
+            rc = run_read_messages(ctx, cfg, args.chat, args.max_bubbles,
+                                   crop_out=getattr(args, "crop_out", ""))
+            log_stage("done", "退出码=%s（read-msg 只读模式）" % rc)
+            return rc
+        finally:
+            ctx.finish()
+    if not str(args.text or "").strip():
+        log("失败: --text 不能为空（只读模式请用 --read-msg）")
+        print(json.dumps({"ok": False, "error": "--text 不能为空（只读模式请用 --read-msg）"},
+                         ensure_ascii=False))
+        return 2
     ctx = Ctx(cfg)
     try:
         rc = run(ctx, args)

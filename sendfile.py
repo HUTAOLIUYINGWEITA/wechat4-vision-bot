@@ -2,7 +2,7 @@
 """发文件到微信（远程指令链路专用，2026-10-26 新增）
 
 用法:
-  python sendfile.py --chat "文件传输助手" --file "C:\\path\\to\\your\\file.txt" [--caption "说明"]
+  E:\\anaconda\\python.exe sendfile.py --chat "文件传输助手" --file "E:\\绝对\\路径\\x.txt" [--caption "说明"]
 
 流程:
   校验文件存在 + 敏感文件拦截（credential/key/token/password/密码/令牌/.pem/.pfx 一律拒绝）
@@ -320,6 +320,11 @@ def run_sendfile(args, cfg):
                     "before": before_path, "after": after_path})
             except Exception as exc:
                 log("发送记录落盘失败（不影响已发送）: %s" % exc)
+            try:
+                import watcher as _w
+                _w.memo_log(cfg, "sendfile", "sent %s to %s" % (os.path.basename(path), chat), available=lambda: (True, ""))
+            except Exception:
+                pass
             log_stage("done", "已发送文件 chat=%r file=%r size=%d 用时 %.2fs（%s）" % (
                 chat, path, size, elapsed, reply.mouse_desc(ctx)))
             return 0, {"ok": True, "chat": chat, "file": path, "size": size,

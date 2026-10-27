@@ -17,7 +17,7 @@
 本模块只做只读查询（GetForegroundWindow / GetLastInputInfo / 窗口矩形），
 不点击、不按键、不切前台、不移动光标。
 
-命令行自检: python busyguard.py
+命令行自检: E:\\anaconda\\python.exe busyguard.py
 """
 import ctypes
 import ctypes.wintypes as wt

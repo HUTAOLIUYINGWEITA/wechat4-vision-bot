@@ -4,13 +4,17 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D4?logo=windows)
 ![WeChat](https://img.shields.io/badge/WeChat-4.x-07C160?logo=wechat)
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python)
-![No UI Automation](https://img.shields.io/badge/automation-pixel%20%2B%20OCR-8957e5)
+![No UI Automation](https://img.shields.io/badge/automation-pixel%20%2B%20vision-8957e5)
 
-**微信 4.x 的纯视觉自动回复机器人 —— 像素 + OCR 驱动，不依赖 UIAutomation 控件树。**
+**微信 4.x 的视觉化自动回复机器人 —— 像素检测 + 多模态模型直接看截图理解内容，不依赖 UIAutomation 控件树。**
+
+> 提示：仓库名里的 `vision` 现在是真的 vision —— 模型**直接看聊天区截图**读懂对方说了什么，
+> OCR 只作为定位会话行/校验输入框的辅助手段。
 
 > **English abstract** — A WeChat **4.x (Windows)** auto-reply agent built purely on **vision**:
-> `PrintWindow`/`ImageGrab` screenshots, **Tesseract OCR** (`chi_sim`), controlled clicks and clipboard
-> paste, plus an OpenAI-compatible LLM endpoint for reply generation. Unlike `wxauto` / `pywinauto`
+> `PrintWindow`/`ImageGrab` screenshots for unread detection, **a multimodal LLM that reads the chat
+> screenshot itself** to understand what the other side said, **Tesseract OCR** (`chi_sim`) as an
+> auxiliary for locating conversation rows / verifying the input box, controlled clicks and clipboard paste. Unlike `wxauto` / `pywinauto`
 > (which target WeChat 3.x), it does **not** depend on WeChat's UI control tree — WeChat 4.x is a Qt
 > rewrite, so control-tree automation breaks. Safety first: whitelists, rate limits, text dedupe,
 > circuit breaker, foreground/window checks, and a **disabled-by-default** remote-command path.
@@ -24,6 +28,8 @@
 - [适用条件](#适用条件)
 - [为什么不直接用 wxauto / pywinauto](#为什么不直接用-wxauto--pywinauto)
 - [架构（文字版）](#架构文字版)
+- [视觉理解：模型看图，而不是读 OCR](#视觉理解模型看图而不是读-ocr)
+- [会话类型与「她自己的工作台」](#会话类型与她自己的工作台)
 - [仓库结构](#仓库结构)
 - [安装与配置](#安装与配置)
 - [开关与急停](#开关与急停)
@@ -45,7 +51,8 @@
 自动化库（`wxauto`、`pywinauto` 的那套思路）在 4.x 上直接失效。本项目干脆绕开控件树：
 
 - **看得见**：`PrintWindow` 抓微信窗口（被遮挡也能抓，不抢焦点），检测未读红点 + 会话列表差分；
-- **认得清**：Tesseract OCR（`chi_sim`）识别会话行、输入框、标题；
+- **看得懂**：把聊天区截图直接交给**多模态模型**读——它自己看懂对方说了什么、是群聊还是私聊；
+- **认得清**：Tesseract OCR（`chi_sim`）负责定位会话行、校验输入框/标题（OCR 读歪不再等于「漏回」）；
 - **发得出**：受控点击会话行 + 剪贴板/`SendInput` 输入 + 三重校验 + `Enter`；
 - **拦得住**：白名单、限流、去重、连续失败熔断、急停（三处入口）、注入前前台校验。
 
@@ -91,17 +98,23 @@
         └──────────────────────────────────────┬───────────────────────────────────────┘
                                                │ 新未读（白名单命中才继续）
         ┌──────────────────────────────────────▼───────────────────────────────────────┐
-        │ ② 生成层（genreply.py，进程内直连，不唤醒外部 Agent）                          │
-        │   .credentials.json（provider / baseUrl / model / apiKey）                     │
-        │   + persona.txt（人设）+ 硬性安全规则                                          │
-        │   → POST {baseUrl}/chat/completions（max_tokens <= 120，temperature=0.8）      │
+        │ ② 读消息 + 生成层（reply.py --read-msg + genreply.py）                         │
+        │   只读打开会话 → 抓「聊天区底部」截图 → 多 PSM 双极性 OCR 聚气泡（辅助）        │
+        │   → 存裁剪图 chatcrop-*.png + 读最近 N 条对方消息                              │
+        │   → 【视觉优先】把裁剪图 base64 作为 image_url 发给多模态模型，让它自己读       │
+        │   → OCR 文本仅作参考（标注「可能不准，以图为准」）                              │
+        │   → 视觉失败自动降级为纯文本模式（不会因此发不出去）                            │
+        │   → + persona.txt（人设）+ 会话类型 + 硬性安全规则                              │
         │   → 清洗回复 + 禁用词拦截（转账/密码/验证码/链接/二维码/密钥/发文件…）           │
         └──────────────────────────────────────┬───────────────────────────────────────┘
                                                │ 候选回复
         ┌──────────────────────────────────────▼───────────────────────────────────────┐
         │ ③ 护栏层（sendguard.py）                                                      │
-        │   白名单外绝不发 / 同会话 30s 只发 1 条 / 同会话连续 5 条暂停 30 分钟            │
-        │   / 同一句话 600s 内不重复 / 每条成功发送落 logs/sent-YYYYMMDD.jsonl             │
+        │   白名单外绝不发（闭集判别：在已知会话名里挑最像的，OCR 读歪也不轻易漏）        │
+        │   同会话最小间隔（默认 30s，可降到 4s）/ 连续 N 条暂停 30 分钟                  │
+        │   / 同句去重窗口（默认 60s，命中则要求模型「换一种说法」重生成，不丢弃消息）      │
+        │   / 被限流的消息【入队】而非丢弃：冷却结束合并成一条回复（pendingQueue）         │
+        │   / 每条成功发送落 logs/sent-YYYYMMDD.jsonl                                     │
         └──────────────────────────────────────┬───────────────────────────────────────┘
                                                │ 允许发送
         ┌──────────────────────────────────────▼───────────────────────────────────────┐
@@ -122,7 +135,57 @@
         · breaker      连续发送失败 3 次 → 写 STOP + 熔断记录 + 进程退出（不自启）
         · panic        三处急停：桌面快捷方式 / 全局热键 Ctrl+Alt+Shift+S / 微信发「小耳朵 急停」
         · toggle.ps1   总开关：on = 起进程 + autoSend；off = 杀进程；panic = 立即急停
+        · memoLog     把她做过的「动作」记一行到备忘录（文件传输助手），方便回看做了什么
 ```
+
+## 视觉理解：模型看图，而不是读 OCR
+
+早期版本让模型只看 OCR 转出来的文字，结果非常脆：微信聊天区是**小字 + 深色背景**，OCR 经常把
+「今晚吃什么」认成「今吃什么隐陶」、把「小耳朵」认成「小耳洲」——模型收到的是乱码，自然只能回
+「没看懂，你再说一遍」。
+
+现在改成**视觉优先**：
+
+| 环节 | 做法 |
+|---|---|
+| 取图 | `reply.py --read-msg --crop-out <path>` 只读打开会话，把**聊天区底部**裁成 PNG（约 850×515，30–40 KB） |
+| 送图 | `genreply.generate_with_image()` 把图 base64 成 `data:image/png;base64,...`，以 `image_url` 送进 `content` 数组 |
+| 提示词 | 明确「下面是微信聊天窗口截图，请自己从图里读懂对方最近说了什么」，OCR 文本标注**「可能不准，以图为准」** |
+| 降级 | 图片缺失/接口不支持 → 自动回退纯文本模式，日志 `[GEN] vision 失败 -> 回退文本模式（原因…）` |
+| 成本 | 长边超过 `visionMaxEdge`（默认 1600）先等比缩小；实测每条带图回复约 **840–880 prompt tokens**（纯文本约 500–530） |
+
+顺带还解决了「一条长消息被折行切成碎片」的问题：气泡聚类改成**自适应气泡内行距**
+（同方向 + 左缘 ±10px 对齐 + 行距小于气泡内行距 → 合并成一个气泡，多行按 y 顺序拼接），
+并加了条硬规则——**最终采用的文本不得低于最长候选的 50%**，杜绝「有 60 个字却只选 1 个字」。
+
+## 会话类型与「她自己的工作台」
+
+给模型明确「现在是在跟谁说话」，避免它把私聊当群聊、或对着你自己的备忘录寒暄。
+
+```json
+"chatTypes": { "文件传输助手": "memo", "某个群": "group" }
+```
+
+| 类型 | 含义 | 行为差异 |
+|---|---|---|
+| `group` | 群聊 | 提示「群里可能有多个人说话，只回最近几条」，不按私聊处理 |
+| `private` | 私聊 | 正常一对一 |
+| `memo` | **她自己的备忘录/工作台**（如「文件传输助手」） | 不当成真人在聊；可以在里面记事、一两句即可，但不寒暄 |
+
+未配置时按标题里的 `(N)` 成员数自动推断 `group`。
+
+**memoLog（她自己的工作台记录）**：把「动作」记一行到备忘录，方便回看今天干了什么：
+
+```
+23:20 已把 ROS小乌龟实验1、2.docx 发到 示例群
+23:31 远程指令已执行：查看 D 盘剩余空间 → 剩余 51.4 GB
+23:45 ⚠ 连续 3 次发送失败，已自动急停
+```
+
+- 只记**动作**（远程执行完成 / 发文件成功 / 熔断急停 / 连续失败放弃），普通闲聊**不记录**，避免刷屏
+- 绕过对话护栏（间隔/去重不该拦"记录"），但有自己的一套限流：`maxPerMinute=1`、`maxPerDay=200`
+- 发送失败**绝不影响主流程**，只写审计 `logs/memo-YYYYMMDD.jsonl`
+- 记录里不含密码/apiKey，也不写完整路径（只写文件名）
 
 ## 仓库结构
 
@@ -280,16 +343,29 @@ python reply.py --dry-run --chat "文件传输助手" --text "【测试】dry-ru
 
 - 只有 `whitelist` 里逐字命中的会话才允许自动回复/发送；`blacklist`（默认含微信团队/公众号等）
   永远只记录不动作。
-- 会话名匹配做了 OCR 容错：归一化后 exact 优先，OCR 读错个别字时走「覆盖率 + 相似度 + 唯一性」
-  近似档；命中歧义一律 abort（宁可少回一条，绝不回错人）。
+- 会话名匹配是**闭集判别**：白名单只有几个已知名字，判断「是哪一个」远比自由匹配容易。
+  对每个 OCR 候选 × 每个白名单项算三分（`difflib` 相似度 55% + 字符集重叠 30% + 长度相似 15%），
+  取最高分 ≥ `minComposite`（默认 0.55）且领先第二名 ≥ `minMargin`（默认 0.12）才命中。
+  **多候选全部参与、取最高**——OCR 把「BBB示例测试群」读成「BBB示例测械群」时，另一个候选
+  「BBB示例测群」能拿 0.83 分救回来；旧的前缀匹配会直接 miss 并静默漏回。
+- **灰区复核**：综合分落在 `[greyZoneLow, greyZoneHigh]`（默认 0.55–0.65）时，先打开会话
+  **核对标题**再决定发不发；核对不过就放弃（`whitelist 灰区 -> 标题复核不通过，放弃`）。
+- **miss 不写"已处理"指纹**，只做 `missCooldownSeconds`（默认 45s）的短冷却——OCR 误判导致的
+  miss 还能在下一轮重新判断，不会永久漏回。
 - 执行层还有一层**双重校验**：点开会话后 OCR 校验聊天标题 == 目标会话名；
   群聊标题带 `(N)` 而目标是私聊（或反之）直接 abort。
 
 ### 2) 限流与去重（防止刷屏/复读）
 
-- 同一会话 **30 秒内只发 1 条**（`guard.perChatMinIntervalSeconds`）
-- 同一会话**连续发满 5 条** → 暂停 30 分钟（`perChatMaxBurst` / `burstPauseSeconds`）
-- 同一句话 **600 秒内不重复发**（`dedupeSameText` / `dedupeWindowSeconds`）
+- 同一会话最小发送间隔 `guard.perChatMinIntervalSeconds`（示例默认 30 秒；**聊天场景建议 4–10 秒**，
+  反正发一条本身就要 8–13 秒）
+- 同一会话连续发满 `perChatMaxBurst` 条 → 暂停 `burstPauseSeconds`（示例 12 条 / 30 分钟）
+- 同一句话 `dedupeSameTextWindowSeconds`（默认 **60 秒**）内不重复——
+  这条闸的本意是防「代码进循环后复读」，不是长时间禁言；
+  **命中后不丢弃消息**，而是把「最近已说过的话」塞进提示词，让模型**换一种说法重新生成**（最多 `duplicateRegenAttempts` 次）
+- **限流命中 ≠ 丢弃**：被间隔/连发上限拦下的消息会进 `pendingQueue`，
+  冷却结束后把该会话的多条消息**合并生成一条回复**（`[QUEUE] 冷却结束，合并回复 N 条`），
+  队列有 TTL（默认 600s）和失败退避，过期丢弃时也会记日志
 - 每条成功发送都落 `logs/sent-YYYYMMDD.jsonl`（时间/会话/回复原文/未读指纹），可审计、可回放
 - 有重试上限（`maxRetryAttempts=3`）和重试间隔（`retryAfterSeconds=60`），失败不会无限重试
 
@@ -324,8 +400,20 @@ python reply.py --dry-run --chat "文件传输助手" --text "【测试】dry-ru
 
 - **文本长度 > 12 或含全角标点/引号/括号 → 一律走剪贴板 `Ctrl+V`**，短文本才 `SendInput`；
   两条路互相兜底重试一次，仍不过 → `type-verify-failed` abort，**绝不按 Enter**。
-- 校验用三重判据：字符数比例 ∈ `[0.85, 1.25]`、去重字符集覆盖 ≥ 0.90、`SequenceMatcher` 相似度 ≥ 0.75，
-  另加「相邻重复标点」检查（期望文本里没有 `：：`/`『『`/`((` 这类时，实际 OCR 出现就判失败）。
+- **比较前先剥掉标点**：`，。！？、；：""''（）《》…` 及半角标点全部去掉，只比汉字/字母/数字。
+  否则 OCR 丢一个全角逗号，「嗯嗯，在的」的覆盖率就从 1.0 掉到 0.75、直接被判失败。
+- **阈值按长度自适应**（按去标点后字数）：
+
+  | 档 | 字数 | 字符数比例 | 覆盖 ≥ | 序列相似 ≥ |
+  |---|---|---|---|---|
+  | L1 | ≤ 6 | 0.60–1.40 | 0.60 | 0.50 |
+  | L2 | 7–15 | 0.80–1.30 | 0.80 | 0.70 |
+  | L3 | > 15 | 0.85–1.25 | 0.85 | 0.80 |
+
+  另加「相邻重复标点」检查（期望里没有 `：：`/`『『`/`((` 时，实际 OCR 出现就判失败）。
+- **像素差兜底**：OCR 判不过时，若输入框区域前后像素差 ≥ `reply.inputPixelDiffMin`（默认 0.002），
+  仍判定「内容确实已输入」并继续发送前校验，日志 `evidence=ocr | pixdiff | none` 三态明确。
+  两者都没有 → 不发送。
 - 剪贴板默认**不还原**（`reply.restoreClipboard=false`，用户明确同意）：剪贴板里会残留最后发的一条文本，
   属预期行为；想还原可改 `true`。
 - 发送完默认**保持微信在前台**（`reply.restoreForeground=false`），不主动把前台还给原窗口。

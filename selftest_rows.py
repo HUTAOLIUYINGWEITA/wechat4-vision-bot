@@ -4,12 +4,9 @@
 用途：不用微信、不发消息，直接拿 screenshots 下真实搜索下拉截图当语料，验证
       「面板自适应定位 + 图标判定行类型（头像 vs 灰色放大镜）+ 目标名 exact 匹配 + 歧义 abort」。
 
-⚠ 截图语料是可选的：公开仓库不带 screenshots/（都是真实屏幕截图，含聊天隐私）。
-  没有语料时本脚本只跑「构造用例」纯逻辑回归，不报错、不 FAIL。
-
 用法:
-  python selftest_rows.py                # 默认目标「文件传输助手」
-  python selftest_rows.py --target "某个群聊名称"
+  E:\\anaconda\\python.exe selftest_rows.py                # 默认目标「文件传输助手」
+  E:\\anaconda\\python.exe selftest_rows.py --target "BBB示例测试群"
 
 输出:
   ① 每张图：OCR 行（文本/坐标/图标判定/所属分组）→ 选中行 → 判定 OK/ABORT + 理由
@@ -143,16 +140,16 @@ def fabricated_cases():
                 reply.select_target_row(rows, reply._clean_row_text("文件传输助手")), "ok_approx"))
 
     # ⑥ 两个头像行都跟目标很像、得分接近 -> 近似不唯一 -> ABORT（不瞎猜）
-    rows = [_mkrow("这是一个很长很长的测试群名称", "avatar", "", 150),
-            _mkrow("这是一个很长很长的测试群名称呀", "avatar", "群聊", 190)]
+    rows = [_mkrow("示例长名测试群甲乙丙丁戊", "avatar", "", 150),
+            _mkrow("示例长名测试群甲乙丙丁戊已", "avatar", "群聊", 190)]
     out.append(("构造: 两个近似候选太接近（不唯一）",
                 reply.select_target_row(
-                    rows, reply._clean_row_text("这是一个很长很长的测试群名称啊")), "row-ambiguous"))
+                    rows, reply._clean_row_text("示例长名测试群甲乙丙丁戊己")), "row-ambiguous"))
 
     # ⑦ 覆盖率不足 -> ABORT
     rows = [_mkrow("文件传输", "avatar", "", 150)]
     out.append(("构造: 近似候选覆盖率不足",
-                reply.select_target_row(rows, reply._clean_row_text("这是一个很长很长的测试群名称啊")),
+                reply.select_target_row(rows, reply._clean_row_text("示例长名测试群甲乙丙丁戊己")),
                 "row-approximate"))
     return out
 
@@ -167,7 +164,7 @@ def panel_kind_cases():
         ("会话列表: 2 行时间戳（HH:MM + 昨天）-> conversation-list",
          [mk("文件传输助手 23:20", 130), mk("腾讯新闻 昨天 12:16", 200)], "conversation-list"),
         ("会话列表: 3 行都是裸 HH:MM -> conversation-list",
-         [mk("测试用群聊名称 18:37", 130), mk("某个联系人 16:37", 200), mk("微信团队 09:11", 270)],
+         [mk("BBB示例测试群 18:37", 130), mk("裤子 16:37", 200), mk("微信团队 09:11", 270)],
          "conversation-list"),
         ("搜索下拉: 头像行不带时间戳 -> dropdown",
          [mk("文件传输助手", 130), mk("文件传输助手 打开", 200)], "dropdown"),
@@ -195,14 +192,14 @@ def title_validation_cases():
         ("私聊: 标题 exact", ["文件传输助手"], "文件传输助手", False, True, "ok"),
         ("私聊: 标题带群聊编号 (5) -> 疑似点错群", ["文件传输助手 (5)"], "文件传输助手", False, False,
          "row-group-mismatch"),
-        ("私聊: 目标名被点进「某个很长的群聊名称示例」群聊标题", ["某个很长的群聊名称示例"],
+        ("私聊: 目标名被点进「示例长名测试群甲乙丙丁戊己」群聊标题", ["示例长名测试群甲乙丙丁戊己"],
          "文件传输助手", False, False, "标题不是精确目标名"),
-        ("群聊: 标题形如「名称 (12)」", ["测试用群聊名称(12)"], "测试用群聊名称", True, True, "ok"),
-        ("群聊: 标题不带人数（微信 4.x 实测）", ["测试用群聊名称"], "测试用群聊名称", True, True, "ok"),
+        ("群聊: 标题形如「名称 (12)」", ["BBB示例测试群(12)"], "BBB示例测试群", True, True, "ok"),
+        ("群聊: 标题不带人数（微信 4.x 实测）", ["BBB示例测试群"], "BBB示例测试群", True, True, "ok"),
         # 2026-10-26 晚：点开后标题 OCR 也可能读错字 -> 高覆盖率 + 唯一 放行（安全闸仍在标题）
         ("私聊: 标题 OCR 读错 1 字（近似唯一通过）", ["文件传输助首"], "文件传输助手", False, True,
          "title-approx"),
-        ("私聊: 标题覆盖率不足（仍 abort）", ["文件传"], "这是一个很长很长的测试群名称啊", False, False,
+        ("私聊: 标题覆盖率不足（仍 abort）", ["文件传"], "示例长名测试群甲乙丙丁戊己", False, False,
          "标题不是精确目标名"),
     ]
     out = []
@@ -239,7 +236,7 @@ def main(argv=None):
         files = [f for f in files if args.only in os.path.basename(f)]
     if args.max_files and args.max_files > 0:
         files = files[:args.max_files]
-    print("语料 %d 张%s" % (len(files), "" if files else "（没找到 screenshots/ 截图 -> 跳过真实截图回归，只跑构造用例）"))
+    print("语料 %d 张" % len(files))
     summary = []
     for f in files:
         name = os.path.basename(f)
